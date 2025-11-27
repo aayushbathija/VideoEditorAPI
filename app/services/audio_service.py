@@ -138,7 +138,17 @@ class AudioService:
                 filtered_audio_clip = mp.AudioFileClip(filtered_audio_path)
                 
                 # Check if input was video or audio
-                if video.duration > 0 and hasattr(video, 'w') and video.w > 0:
+                # Try to determine if it's a video file by checking for video properties
+                is_video_file = False
+                try:
+                    # Check if video has video track (width and height)
+                    if hasattr(video, 'w') and hasattr(video, 'h') and video.w and video.h:
+                        is_video_file = True
+                except AttributeError:
+                    # If we can't access video properties, treat as audio-only
+                    is_video_file = False
+                
+                if is_video_file:
                     # Input was video, combine filtered audio with original video
                     final_clip = video.set_audio(filtered_audio_clip)
                     final_clip.write_videofile(
@@ -187,9 +197,17 @@ class AudioService:
             
             info = {
                 'duration': audio.duration,
-                'fps': audio.fps,
                 'has_audio': True
             }
+            
+            # Try to get fps, but it might not be available for all audio clips
+            try:
+                if hasattr(audio, 'fps') and audio.fps:
+                    info['fps'] = audio.fps
+                else:
+                    info['fps'] = 44100  # Default sample rate
+            except AttributeError:
+                info['fps'] = 44100  # Default sample rate
             
             audio.close()
             video.close()
