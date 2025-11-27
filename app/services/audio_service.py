@@ -91,15 +91,43 @@ class AudioService:
             filtered_audio_path = os.path.join(temp_dir, "filtered_audio.wav")
             
             try:
-                # Extract audio from input file (works for both audio and video)
-                video = mp.VideoFileClip(input_path)
-                audio = video.audio
+                # Try to determine if it's an audio file first
+                is_audio_file = input_path.lower().endswith(('.mp3', '.wav', '.aac', '.ogg', '.flac', '.m4a'))
+                
+                if is_audio_file:
+                    # Load as audio file directly
+                    try:
+                        audio = mp.AudioFileClip(input_path)
+                        video = None  # No video component
+                    except Exception:
+                        # Fallback to video clip if audio loading fails
+                        video = mp.VideoFileClip(input_path)
+                        audio = video.audio
+                else:
+                    # Load as video file and extract audio
+                    video = mp.VideoFileClip(input_path)
+                    audio = video.audio
                 
                 if audio is None:
                     raise ValueError("Input file has no audio track")
                 
                 # Export audio as WAV for processing
-                audio.write_audiofile(temp_audio_path, logger=None, verbose=False)
+                try:
+                    audio.write_audiofile(temp_audio_path, logger=None, verbose=False)
+                except Exception as e:
+                    logger.error(f"Error writing audio file: {e}")
+                    # Try alternative approach - load audio directly if write fails
+                    if hasattr(audio, 'to_soundarray'):
+                        import scipy.io.wavfile as wav
+                        try:
+                            # Get audio array and sample rate
+                            audio_array = audio.to_soundarray(fps=44100)
+                            wav.write(temp_audio_path, 44100, audio_array)
+                        except Exception as e2:
+                            logger.error(f"Alternative audio export also failed: {e2}")
+                            raise e
+                    else:
+                        raise e
                 
                 # Read audio file
                 fs, audio_data = read(temp_audio_path)
@@ -138,15 +166,16 @@ class AudioService:
                 filtered_audio_clip = mp.AudioFileClip(filtered_audio_path)
                 
                 # Check if input was video or audio
-                # Try to determine if it's a video file by checking for video properties
+                # If video is None, it's definitely audio-only
                 is_video_file = False
-                try:
-                    # Check if video has video track (width and height)
-                    if hasattr(video, 'w') and hasattr(video, 'h') and video.w and video.h:
-                        is_video_file = True
-                except AttributeError:
-                    # If we can't access video properties, treat as audio-only
-                    is_video_file = False
+                if video is not None:
+                    try:
+                        # Check if video has video track (width and height)
+                        if hasattr(video, 'w') and hasattr(video, 'h') and video.w and video.h:
+                            is_video_file = True
+                    except AttributeError:
+                        # If we can't access video properties, treat as audio-only
+                        is_video_file = False
                 
                 if is_video_file:
                     # Input was video, combine filtered audio with original video
@@ -163,7 +192,8 @@ class AudioService:
                     filtered_audio_clip.write_audiofile(output_path, logger=None, verbose=False)
                 
                 # Clean up clips
-                video.close()
+                if video is not None:
+                    video.close()
                 audio.close()
                 filtered_audio_clip.close()
                 if 'final_clip' in locals():
