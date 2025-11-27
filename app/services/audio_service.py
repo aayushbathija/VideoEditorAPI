@@ -91,31 +91,26 @@ class AudioService:
             filtered_audio_path = os.path.join(temp_dir, "filtered_audio.wav")
             
             try:
-                # Try to determine if it's an audio file first
-                is_audio_file = input_path.lower().endswith(('.mp3', '.wav', '.aac', '.ogg', '.flac', '.m4a'))
-                
-                if is_audio_file:
-                    # Load as audio file directly
-                    try:
-                        audio = mp.AudioFileClip(input_path)
-                        video = None  # No video component
-                    except Exception:
-                        # Fallback to video clip if audio loading fails
-                        video = mp.VideoFileClip(input_path)
-                        audio = video.audio
-                else:
-                    # Load as video file and extract audio
-                    video = mp.VideoFileClip(input_path)
-                    audio = video.audio
+                logger.debug(f"Step 1: Loading audio file from {input_path}")
+                # For voice filters, always treat input as audio file
+                # This eliminates video-related property access issues
+                audio = mp.AudioFileClip(input_path)
+                logger.debug(f"Step 2: Audio clip loaded successfully")
+                video = None  # No video handling for voice filters
                 
                 if audio is None:
                     raise ValueError("Input file has no audio track")
                 
+                logger.debug(f"Step 3: Audio duration: {audio.duration}s")
+                
                 # Export audio as WAV for processing
+                logger.debug(f"Step 4: Exporting audio to WAV format")
                 try:
                     audio.write_audiofile(temp_audio_path, logger=None, verbose=False)
+                    logger.debug(f"Step 5: Audio exported successfully to {temp_audio_path}")
                 except Exception as e:
                     logger.error(f"Error writing audio file: {e}")
+                    logger.debug(f"Step 5-fallback: Trying alternative audio export")
                     # Try alternative approach - load audio directly if write fails
                     if hasattr(audio, 'to_soundarray'):
                         import scipy.io.wavfile as wav
@@ -123,6 +118,7 @@ class AudioService:
                             # Get audio array and sample rate
                             audio_array = audio.to_soundarray(fps=44100)
                             wav.write(temp_audio_path, 44100, audio_array)
+                            logger.debug(f"Step 5-fallback: Alternative audio export successful")
                         except Exception as e2:
                             logger.error(f"Alternative audio export also failed: {e2}")
                             raise e
@@ -130,11 +126,14 @@ class AudioService:
                         raise e
                 
                 # Read audio file
+                logger.debug(f"Step 6: Reading audio data from WAV file")
                 fs, audio_data = read(temp_audio_path)
                 logger.info(f"Audio loaded: {fs}Hz sample rate, {len(audio_data)} samples")
                 
                 # Handle stereo audio by processing each channel
+                logger.debug(f"Step 7: Processing audio filter - channels: {len(audio_data.shape)}")
                 if len(audio_data.shape) > 1:
+                    logger.debug(f"Step 7a: Processing {audio_data.shape[1]} channels (stereo)")
                     filtered_channels = []
                     for channel in range(audio_data.shape[1]):
                         channel_data = audio_data[:, channel]
@@ -150,6 +149,7 @@ class AudioService:
                     # Combine channels back
                     filtered_signal = np.column_stack(filtered_channels)
                 else:
+                    logger.debug(f"Step 7b: Processing mono audio")
                     # Mono audio
                     filtered_signal = self.butter_bandpass_filter(
                         audio_data,
@@ -159,45 +159,22 @@ class AudioService:
                         order=filter_config['order']
                     )
                 
+                logger.debug(f"Step 8: Saving filtered audio to {filtered_audio_path}")
                 # Save filtered audio as WAV
                 write(filtered_audio_path, fs, np.array(filtered_signal, dtype=np.int16))
                 
-                # Create output video/audio with filtered audio
+                logger.debug(f"Step 9: Creating filtered audio clip")
+                # Create output audio with filtered audio
                 filtered_audio_clip = mp.AudioFileClip(filtered_audio_path)
                 
-                # Check if input was video or audio
-                # If video is None, it's definitely audio-only
-                is_video_file = False
-                if video is not None:
-                    try:
-                        # Check if video has video track (width and height)
-                        if hasattr(video, 'w') and hasattr(video, 'h') and video.w and video.h:
-                            is_video_file = True
-                    except AttributeError:
-                        # If we can't access video properties, treat as audio-only
-                        is_video_file = False
+                logger.debug(f"Step 10: Writing final output to {output_path}")
+                # Since voice filters are for audio only, always output audio
+                filtered_audio_clip.write_audiofile(output_path, logger=None, verbose=False)
                 
-                if is_video_file:
-                    # Input was video, combine filtered audio with original video
-                    final_clip = video.set_audio(filtered_audio_clip)
-                    final_clip.write_videofile(
-                        output_path,
-                        codec='libx264',
-                        audio_codec='aac',
-                        logger=None,
-                        verbose=False
-                    )
-                else:
-                    # Input was audio only, export as audio
-                    filtered_audio_clip.write_audiofile(output_path, logger=None, verbose=False)
-                
+                logger.debug(f"Step 11: Cleaning up clips")
                 # Clean up clips
-                if video is not None:
-                    video.close()
                 audio.close()
                 filtered_audio_clip.close()
-                if 'final_clip' in locals():
-                    final_clip.close()
                 
                 logger.info(f"Voice filter applied successfully: {output_path}")
                 return output_path

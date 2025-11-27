@@ -26,7 +26,7 @@ from app.services.video_filter_service import VideoFilterService
 from app.utils.download_utils import download_file
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
