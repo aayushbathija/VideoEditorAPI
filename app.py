@@ -23,6 +23,7 @@ from app.services.subtitle_service import SubtitleService
 from app.services.job_manager import JobManager
 from app.services.audio_service import AudioService
 from app.services.video_filter_service import VideoFilterService
+from app.services.aspect_ratio_service import AspectRatioService
 from app.utils.download_utils import download_file
 
 # Configure logging
@@ -38,6 +39,7 @@ subtitle_service = SubtitleService()
 job_manager = JobManager()
 audio_service = AudioService()
 video_filter_service = VideoFilterService()
+aspect_ratio_service = AspectRatioService()
 
 # Auto-detect optimal workers (use all available cores)
 optimal_workers = min(psutil.cpu_count(logical=True), 8)  # Cap at 8 for stability
@@ -491,6 +493,98 @@ def get_filter_parameters(filter_type):
         })
     except Exception as e:
         logger.error(f"Error getting filter parameters: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/video-aspect-ratio', methods=['POST'])
+def change_video_aspect_ratio():
+    """Change video aspect ratio with different scaling modes."""
+    try:
+        data = request.get_json()
+        
+        # Validate required fields
+        if not data or 'url' not in data:
+            return jsonify({"error": "Missing required field: url"}), 400
+        
+        if 'aspect_ratio' not in data:
+            return jsonify({"error": "Missing required field: aspect_ratio"}), 400
+        
+        # Get parameters
+        aspect_ratio = data['aspect_ratio']
+        scale_mode = data.get('scale_mode', 'fit')
+        target_height = data.get('target_height')
+        
+        # Validate aspect ratio
+        try:
+            aspect_ratio_service.parse_aspect_ratio(aspect_ratio)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        
+        # Validate scale mode
+        if scale_mode not in aspect_ratio_service.get_scale_modes():
+            return jsonify({
+                "error": f"Invalid scale mode: {scale_mode}",
+                "available_modes": list(aspect_ratio_service.get_scale_modes().keys())
+            }), 400
+        
+        job_id = str(uuid.uuid4())
+        
+        # Job data
+        job_data = {
+            "url": data['url'],
+            "aspect_ratio": aspect_ratio,
+            "scale_mode": scale_mode,
+            "target_height": target_height,
+            "scale_mode_info": aspect_ratio_service.get_scale_modes()[scale_mode]
+        }
+        
+        job_manager.create_job(job_id, "aspect_ratio", "pending", job_data)
+        resource_stats["job_count"] += 1
+        
+        executor.submit(process_aspect_ratio_job, job_id, job_data)
+        
+        return jsonify({
+            "job_id": job_id,
+            "status": "pending",
+            "message": f"Aspect ratio change started",
+            "aspect_ratio": aspect_ratio,
+            "scale_mode": scale_mode,
+            "scale_mode_info": aspect_ratio_service.get_scale_modes()[scale_mode],
+            "estimated_workers": optimal_workers
+        })
+        
+    except Exception as e:
+        logger.error(f"Error starting aspect ratio job: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/video-aspect-ratio/ratios', methods=['GET'])
+def list_aspect_ratios():
+    """Get list of common aspect ratios."""
+    try:
+        ratios = aspect_ratio_service.get_common_ratios()
+        return jsonify({
+            "common_ratios": ratios,
+            "examples": {
+                "youtube": "16:9",
+                "tiktok": "9:16", 
+                "instagram_post": "1:1",
+                "instagram_story": "9:16"
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error listing aspect ratios: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/video-aspect-ratio/modes', methods=['GET'])
+def list_scale_modes():
+    """Get list of available scaling modes."""
+    try:
+        modes = aspect_ratio_service.get_scale_modes()
+        return jsonify({
+            "scale_modes": modes,
+            "default_mode": "fit"
+        })
+    except Exception as e:
+        logger.error(f"Error listing scale modes: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/job-status/<job_id>', methods=['GET'])
@@ -1011,6 +1105,67 @@ def process_video_filter_job(job_id, data):
         cleanup_files = [
             input_path,
             f"temp/{job_id}_filtered.mp4"
+        ]
+        for file_path in cleanup_files:
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+    
+    finally:
+        # Clean up input file
+        if input_path and os.path.exists(input_path):
+            try:
+                os.remove(input_path)
+            except:
+                pass
+
+def process_aspect_ratio_job(job_id, data):
+    """Process aspect ratio change job."""
+    input_path = None
+    start_time = time.time()
+    
+    try:
+        job_manager.update_job_status(job_id, "processing", 10, "🚀 Starting aspect ratio change...")
+        
+        # Download input video
+        job_manager.update_job_status(job_id, "processing", 15, "📥 Downloading video...")
+        input_path = download_file(data['url'], 'temp', f"{job_id}_input.mp4")
+        job_manager.update_job_status(job_id, "processing", 30, "✅ Video downloaded")
+        
+        output_path = f"temp/{job_id}_aspect_changed.mp4"
+        
+        job_manager.update_job_status(job_id, "processing", 35, f"📐 Changing aspect ratio to {data['aspect_ratio']}...")
+        
+        # Apply aspect ratio change
+        aspect_ratio_service.change_aspect_ratio(
+            input_path,
+            output_path,
+            data['aspect_ratio'],
+            data['scale_mode'],
+            data.get('target_height')
+        )
+        
+        # Verify output
+        if not os.path.exists(output_path):
+            raise Exception("Aspect ratio change failed - output file not created")
+        
+        processing_time = time.time() - start_time
+        job_manager.update_job_status(job_id, "completed", 100, f"✅ Aspect ratio changed in {processing_time:.1f}s")
+        
+        job_manager.complete_job(job_id, {"output_path": output_path})
+        
+    except Exception as e:
+        processing_time = time.time() - start_time
+        error_message = f"Error changing aspect ratio: {str(e)}"
+        logger.error(f"Job {job_id} failed: {error_message}")
+        job_manager.fail_job(job_id, error_message)
+        
+        # Clean up partial files on failure
+        cleanup_files = [
+            input_path,
+            f"temp/{job_id}_aspect_changed.mp4"
         ]
         for file_path in cleanup_files:
             if file_path and os.path.exists(file_path):
