@@ -36,8 +36,8 @@ COPY . .
 # Create necessary directories
 RUN mkdir -p temp uploads jobs static
 
-# Set environment variables for optimized performance
-ENV FLASK_APP=app_optimized.py
+# Set environment variables
+ENV FLASK_APP=app.py
 ENV FLASK_ENV=production
 ENV PYTHONPATH=/app
 ENV PORT=8080
@@ -49,5 +49,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
-# Run the optimized application
-CMD ["python", "app_optimized.py"]
+# Run the unified application
+CMD ["python", "app.py"]

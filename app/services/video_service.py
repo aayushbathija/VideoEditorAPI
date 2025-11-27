@@ -1,4 +1,4 @@
-from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip, concatenate_videoclips, AudioFileClip
+from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip, concatenate_videoclips, AudioFileClip, CompositeAudioClip, concatenate_audioclips
 import os
 from typing import List, Dict, Any, Tuple
 import math
@@ -82,11 +82,12 @@ class VideoService:
             else:
                 final_video = video
             
-            # Write output video
+            # Write output video with high-quality audio
             final_video.write_videofile(
                 output_path,
                 codec='libx264',
                 audio_codec='aac',
+                audio_bitrate='320k',
                 temp_audiofile='temp-audio.m4a',
                 remove_temp=True,
                 verbose=False,
@@ -314,11 +315,12 @@ class VideoService:
             # Split video
             split_video = video.subclip(start_time, end_time)
             
-            # Write output
+            # Write output with high-quality audio
             split_video.write_videofile(
                 output_path,
                 codec='libx264',
                 audio_codec='aac',
+                audio_bitrate='320k',
                 verbose=False,
                 logger=None
             )
@@ -359,11 +361,12 @@ class VideoService:
             # Concatenate videos
             final_video = concatenate_videoclips(video_clips, method="compose")
             
-            # Write output
+            # Write output with high-quality audio
             final_video.write_videofile(
                 output_path,
                 codec='libx264',
                 audio_codec='aac',
+                audio_bitrate='320k',
                 verbose=False,
                 logger=None
             )
@@ -434,11 +437,12 @@ class VideoService:
             # Create final video
             final_video = video.set_audio(final_audio)
             
-            # Write output
+            # Write output with high-quality audio
             final_video.write_videofile(
                 output_path,
                 codec='libx264',
                 audio_codec='aac',
+                audio_bitrate='320k',
                 verbose=False,
                 logger=None
             )
@@ -452,6 +456,78 @@ class VideoService:
             
         except Exception as e:
             raise Exception(f"Error adding music to video: {str(e)}")
+    
+    def add_audio_to_clip(self, video_path: str, audio_path: str, output_path: str, 
+                         settings: Dict[str, Any]) -> str:
+        """
+        Add audio to video and trim video to match audio length.
+        
+        Args:
+            video_path: Path to input video
+            audio_path: Path to audio file
+            output_path: Path for output video
+            settings: Audio settings (volume, fade_in, fade_out, replace_audio)
+            
+        Returns:
+            Path to the output video
+        """
+        try:
+            # Load video and audio
+            video = VideoFileClip(video_path)
+            audio = AudioFileClip(audio_path)
+            
+            # Get settings
+            volume = settings.get("volume", 0.5)
+            fade_in = settings.get("fade_in", 0)
+            fade_out = settings.get("fade_out", 0)
+            replace_audio = settings.get("replace_audio", False)
+            
+            # Adjust audio volume
+            audio = audio.volumex(volume)
+            
+            # Trim video to audio length
+            if video.duration > audio.duration:
+                video = video.subclip(0, audio.duration)
+            elif video.duration < audio.duration:
+                # Trim audio to video length if video is shorter
+                audio = audio.subclip(0, video.duration)
+            
+            # Apply fade effects to audio
+            if fade_in > 0:
+                audio = audio.fadein(fade_in)
+            if fade_out > 0:
+                audio = audio.fadeout(fade_out)
+            
+            # Handle audio composition
+            if replace_audio or video.audio is None:
+                # Replace original audio completely
+                final_audio = audio
+            else:
+                # Mix original audio with new audio
+                final_audio = CompositeAudioClip([video.audio, audio])
+            
+            # Create final video
+            final_video = video.set_audio(final_audio)
+            
+            # Write output with high-quality audio
+            final_video.write_videofile(
+                output_path,
+                codec='libx264',
+                audio_codec='aac',
+                audio_bitrate='320k',
+                verbose=False,
+                logger=None
+            )
+            
+            # Clean up
+            video.close()
+            audio.close()
+            final_video.close()
+            
+            return output_path
+            
+        except Exception as e:
+            raise Exception(f"Error adding audio to clip: {str(e)}")
     
     def get_video_info(self, video_path: str) -> Dict[str, Any]:
         """

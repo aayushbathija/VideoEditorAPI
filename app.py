@@ -1,49 +1,73 @@
+"""
+Unified VideoEditor API Server
+Uses all available system resources with Whisper tiny model.
+"""
+
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import os
 import uuid
 import threading
+import psutil
+import time
+import math
 from concurrent.futures import ThreadPoolExecutor
 import json
 from datetime import datetime
 import re
+import logging
 
+# Import services
 from app.services.video_service import VideoService
-# from app.services.subtitle_service import SubtitleService  # Temporarily disabled
+from app.services.subtitle_service import SubtitleService
 from app.services.job_manager import JobManager
+from app.services.audio_service import AudioService
+from app.services.video_filter_service import VideoFilterService
 from app.utils.download_utils import download_file
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
 
 # Initialize services
 video_service = VideoService()
-# subtitle_service = SubtitleService()  # Temporarily disabled
+subtitle_service = SubtitleService()
 job_manager = JobManager()
+audio_service = AudioService()
+video_filter_service = VideoFilterService()
 
-# Thread pool for async processing
-executor = ThreadPoolExecutor(max_workers=4)
+# Auto-detect optimal workers (use all available cores)
+optimal_workers = min(psutil.cpu_count(logical=True), 8)  # Cap at 8 for stability
+executor = ThreadPoolExecutor(max_workers=optimal_workers)
+
+# Resource monitoring
+resource_stats = {
+    "peak_memory": 0,
+    "average_cpu": 0,
+    "job_count": 0,
+    "warnings": []
+}
+
+logger.info(f"🚀 VideoEditor API initialized with {optimal_workers} workers")
+logger.info(f"💾 System: {psutil.virtual_memory().total/(1024**3):.1f}GB RAM, {psutil.cpu_count()} CPU cores")
+logger.info(f"🎙️ Whisper Model: tiny (fixed)")
 
 def parse_time_to_seconds(time_input):
-    """
-    Convert time format to seconds.
-    Supports:
-    - Numeric seconds: 5.5 or "5.5"
-    - SRT format: "00:00:05,500" or "00:00:05.500"
-    - Simple format: "05.5"
-    """
+    """Convert time format to seconds."""
     if isinstance(time_input, (int, float)):
         return float(time_input)
     
     if isinstance(time_input, str):
-        # Try to parse as float first
         try:
             return float(time_input)
         except ValueError:
             pass
         
-        # Parse SRT time format: HH:MM:SS,mmm or HH:MM:SS.mmm
-        time_pattern = r'(\d{1,2}):(\d{1,2}):(\d{1,2})[,.](\d{3})'
+        # Parse time formats: HH:MM:SS,mmm or HH:MM:SS.mmm or HH:MM:SS:mmm
+        time_pattern = r'(\d{1,2}):(\d{1,2}):(\d{1,2})[,.:](\d{3})'
         match = re.match(time_pattern, time_input.strip())
         
         if match:
@@ -55,70 +79,154 @@ def parse_time_to_seconds(time_input):
             total_seconds = hours * 3600 + minutes * 60 + seconds + milliseconds / 1000.0
             return total_seconds
         
-        # If no pattern matches, raise an error
         raise ValueError(f"Invalid time format: {time_input}")
     
     raise ValueError(f"Unsupported time type: {type(time_input)}")
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
+    """Enhanced health check with system information."""
+    memory = psutil.virtual_memory()
+    cpu_percent = psutil.cpu_percent()
+    
+    # Update peak memory tracking
+    current_memory_percent = memory.percent / 100
+    if current_memory_percent > resource_stats["peak_memory"]:
+        resource_stats["peak_memory"] = current_memory_percent
+    
+    health_data = {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "resources": {
+            "cpu_usage_percent": cpu_percent,
+            "memory_usage_percent": memory.percent,
+            "memory_available_mb": memory.available / (1024 * 1024),
+            "workers": optimal_workers,
+            "total_cpu_cores": psutil.cpu_count(logical=True),
+            "physical_cpu_cores": psutil.cpu_count(logical=False)
+        },
+        "whisper_model": {
+            "status": "loaded" if hasattr(subtitle_service, 'current_model') else "ready",
+            "model": "tiny",  # Always tiny
+            "fp16_enabled": True
+        },
+        "performance_stats": {
+            "peak_memory": resource_stats["peak_memory"],
+            "average_cpu": cpu_percent,
+            "job_count": resource_stats["job_count"],
+            "warnings": resource_stats["warnings"][-5:]  # Last 5 warnings
+        }
+    }
+    
+    return jsonify(health_data)
 
-@app.route('/add-subtitles', methods=['POST'])
-def add_subtitles():
+@app.route('/generate-subtitles', methods=['POST'])
+def generate_subtitles():
+    """Generate subtitles only without adding to video."""
     try:
         data = request.get_json()
         
-        # Log request info
-        print(f"📝 Processing subtitle request")
+        if not data or 'url' not in data:
+            return jsonify({"error": "Missing required 'url' parameter"}), 400
         
-        # Validate required fields
+        job_id = str(uuid.uuid4())
+        project_id = data.get('project_id', str(uuid.uuid4()))
+        
+        # Check if subtitles already exist for this project
+        existing_subtitles = job_manager.get_project_subtitles(project_id)
+        if existing_subtitles:
+            return jsonify({
+                "message": "Subtitles already exist for this project",
+                "project_id": project_id,
+                "created_at": existing_subtitles["created_at"],
+                "subtitle_count": len(existing_subtitles["subtitle_data"]),
+                "status": "already_exists"
+            })
+        
+        # Settings for subtitle generation only
+        generation_settings = {
+            "project_id": project_id,
+            "url": data['url'],
+            "language": data.get("language", "en"),
+            "timing_offset": data.get("timing_offset", 0.0),
+            "model": "tiny"  # Force tiny model
+        }
+        
+        job_manager.create_job(job_id, "generate_subtitles", "pending", generation_settings)
+        resource_stats["job_count"] += 1
+        
+        executor.submit(process_generate_subtitles_job, job_id, generation_settings)
+        
+        return jsonify({
+            "job_id": job_id,
+            "project_id": project_id,
+            "project_id_generated": project_id != data.get('project_id'),
+            "status": "pending",
+            "message": "Subtitle generation started",
+            "whisper_model": "tiny",
+            "estimated_workers": optimal_workers,
+            "check_status_url": f"/job-status/{job_id}"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error starting subtitle generation: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/add-subtitles', methods=['POST'])
+def add_subtitles():
+    """Add subtitles to video, generating them if they don't exist."""
+    try:
+        data = request.get_json()
+        
         if not data or 'url' not in data:
             return jsonify({"error": "Missing required field: url"}), 400
         
-        # Create job ID
         job_id = str(uuid.uuid4())
         
-        # Default settings (simplified)
+        # Default settings
         default_settings = {
             "language": "en",
-            "return_subtitles_file": True,  # Always return subtitle files
-            "word_level_mode": "karaoke",   # Default to karaoke mode
+            "return_subtitles_file": True,
+            "word_level_mode": "karaoke",
+            "model": "tiny",  # Force tiny model
             "settings": {
                 "font-size": 120,
                 "font-family": "Luckiest Guy",
                 "line-color": "#FFF4E9", 
                 "outline-width": 10,
-                "normal-color": "#FFFFFF"      # Used for both normal and highlighting
+                "normal-color": "#FFFFFF"
             }
         }
         
-        # Merge with provided settings  
+        # Merge with provided settings
         settings = {**default_settings, **data}
-        
-        # Merge nested settings properly
         if "settings" in data:
             settings["settings"] = {**default_settings["settings"], **data["settings"]}
         
-        # Start async processing
         job_manager.create_job(job_id, "add_subtitles", "pending", settings)
+        resource_stats["job_count"] += 1
+        
         executor.submit(process_subtitle_job, job_id, settings)
         
         return jsonify({
             "job_id": job_id,
             "status": "pending",
-            "message": "Subtitle processing started"
+            "message": "Subtitle processing started",
+            "whisper_model": "tiny",
+            "estimated_workers": optimal_workers
         })
         
     except Exception as e:
+        logger.error(f"Error starting subtitle job: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/split-video', methods=['POST'])
 def split_video():
+    """Split video by time range."""
     try:
         data = request.get_json()
         
-        # Validate input: must have either 'url' or 'job_id', plus time fields
+        # Validate input
         has_url = 'url' in data
         has_job_id = 'job_id' in data
         
@@ -148,59 +256,64 @@ def split_video():
         except ValueError as e:
             return jsonify({"error": f"Invalid time format: {str(e)}"}), 400
         
-        # Create job ID
         job_id = str(uuid.uuid4())
         
-        # Update data with parsed times
         processed_data = {
             **data,
             'start_time': start_seconds,
             'end_time': end_seconds
         }
         
-        # Start async processing
         job_manager.create_job(job_id, "split_video", "pending", processed_data)
+        resource_stats["job_count"] += 1
+        
         executor.submit(process_split_job, job_id, processed_data)
         
         return jsonify({
             "job_id": job_id,
             "status": "pending",
-            "message": "Video splitting started"
+            "message": "Video splitting started",
+            "estimated_workers": optimal_workers
         })
         
     except Exception as e:
+        logger.error(f"Error starting split job: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/join-videos', methods=['POST'])
 def join_videos():
+    """Join multiple videos together."""
     try:
         data = request.get_json()
         
-        # Validate required fields
         if not data or 'urls' not in data or not isinstance(data['urls'], list):
             return jsonify({"error": "Missing required field: urls (must be an array)"}), 400
         
         if len(data['urls']) < 2:
             return jsonify({"error": "At least 2 video URLs are required"}), 400
         
-        # Create job ID
         job_id = str(uuid.uuid4())
         
-        # Start async processing
         job_manager.create_job(job_id, "join_videos", "pending", data)
+        resource_stats["job_count"] += 1
+        
         executor.submit(process_join_job, job_id, data)
         
         return jsonify({
             "job_id": job_id,
             "status": "pending",
-            "message": "Video joining started"
+            "message": "Video joining started",
+            "video_count": len(data['urls']),
+            "estimated_workers": optimal_workers
         })
         
     except Exception as e:
+        logger.error(f"Error starting join job: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/add-music', methods=['POST'])
 def add_music():
+    """Add background music to video."""
     try:
         data = request.get_json()
         
@@ -210,61 +323,217 @@ def add_music():
             if field not in data:
                 return jsonify({"error": f"Missing required field: {field}"}), 400
         
-        # Create job ID
         job_id = str(uuid.uuid4())
         
-        # Optional settings
+        # Optional settings with proper type conversion
         settings = {
-            "volume": data.get('volume', 0.5),  # Music volume (0.0 to 1.0)
-            "fade_in": data.get('fade_in', 0),  # Fade in duration in seconds
-            "fade_out": data.get('fade_out', 0),  # Fade out duration in seconds
-            "loop_music": data.get('loop_music', False)  # Loop music to match video length
+            "volume": float(data.get('volume', 0.5)),
+            "fade_in": float(data.get('fade_in', 0)),
+            "fade_out": float(data.get('fade_out', 0)),
+            "loop_music": str(data.get('loop_music', False)).lower() in ['true', '1', 'yes']
         }
         
         job_data = {**data, "settings": settings}
         
-        # Start async processing
         job_manager.create_job(job_id, "add_music", "pending", job_data)
+        resource_stats["job_count"] += 1
+        
         executor.submit(process_music_job, job_id, job_data)
         
         return jsonify({
             "job_id": job_id,
             "status": "pending",
-            "message": "Music addition started"
+            "message": "Music addition started",
+            "estimated_workers": optimal_workers
         })
         
     except Exception as e:
+        logger.error(f"Error starting music job: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/voice-filters', methods=['POST'])
+def apply_voice_filter():
+    """Apply voice filters to audio/video files."""
+    try:
+        data = request.get_json()
+        
+        # Validate required fields
+        if not data or 'url' not in data:
+            return jsonify({"error": "Missing required field: url"}), 400
+        
+        # Get filter type (default to telephone)
+        filter_type = data.get('filter_type', 'telephone')
+        
+        # Validate filter type
+        supported_filters = audio_service.get_supported_filters()
+        if filter_type not in supported_filters:
+            return jsonify({
+                "error": f"Unsupported filter type: {filter_type}",
+                "supported_filters": supported_filters
+            }), 400
+        
+        job_id = str(uuid.uuid4())
+        
+        # Job data
+        job_data = {
+            "url": data['url'],
+            "filter_type": filter_type,
+            "filter_info": supported_filters[filter_type]
+        }
+        
+        job_manager.create_job(job_id, "voice_filter", "pending", job_data)
+        resource_stats["job_count"] += 1
+        
+        executor.submit(process_voice_filter_job, job_id, job_data)
+        
+        return jsonify({
+            "job_id": job_id,
+            "status": "pending",
+            "message": f"Voice filter processing started",
+            "filter_applied": supported_filters[filter_type],
+            "estimated_workers": optimal_workers
+        })
+        
+    except Exception as e:
+        logger.error(f"Error starting voice filter job: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/voice-filters/list', methods=['GET'])
+def list_voice_filters():
+    """Get list of available voice filters."""
+    try:
+        supported_filters = audio_service.get_supported_filters()
+        return jsonify({
+            "supported_filters": supported_filters,
+            "default_filter": "telephone"
+        })
+    except Exception as e:
+        logger.error(f"Error listing voice filters: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/video-filters', methods=['POST'])
+def apply_video_filter():
+    """Apply visual filters to video files."""
+    try:
+        data = request.get_json()
+        
+        # Validate required fields
+        if not data or 'url' not in data:
+            return jsonify({"error": "Missing required field: url"}), 400
+        
+        # Get filter type (default to crt)
+        filter_type = data.get('filter_type', 'crt')
+        
+        # Validate filter type
+        supported_filters = video_filter_service.get_supported_filters()
+        if filter_type not in supported_filters:
+            return jsonify({
+                "error": f"Unsupported filter type: {filter_type}",
+                "supported_filters": supported_filters
+            }), 400
+        
+        # Get custom parameters if provided
+        custom_params = data.get('parameters', {})
+        
+        job_id = str(uuid.uuid4())
+        
+        # Job data
+        job_data = {
+            "url": data['url'],
+            "filter_type": filter_type,
+            "custom_parameters": custom_params,
+            "filter_info": supported_filters[filter_type]
+        }
+        
+        job_manager.create_job(job_id, "video_filter", "pending", job_data)
+        resource_stats["job_count"] += 1
+        
+        executor.submit(process_video_filter_job, job_id, job_data)
+        
+        return jsonify({
+            "job_id": job_id,
+            "status": "pending",
+            "message": f"Video filter processing started",
+            "filter_applied": supported_filters[filter_type],
+            "custom_parameters": custom_params,
+            "estimated_workers": optimal_workers
+        })
+        
+    except Exception as e:
+        logger.error(f"Error starting video filter job: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/video-filters/list', methods=['GET'])
+def list_video_filters():
+    """Get list of available video filters."""
+    try:
+        supported_filters = video_filter_service.get_supported_filters()
+        return jsonify({
+            "supported_filters": supported_filters,
+            "default_filter": "crt"
+        })
+    except Exception as e:
+        logger.error(f"Error listing video filters: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/video-filters/parameters/<filter_type>', methods=['GET'])
+def get_filter_parameters(filter_type):
+    """Get default parameters for a specific filter."""
+    try:
+        parameters = video_filter_service.get_filter_parameters(filter_type)
+        if parameters is None:
+            return jsonify({"error": f"Filter type '{filter_type}' not found"}), 404
+        
+        return jsonify({
+            "filter_type": filter_type,
+            "parameters": parameters,
+            "description": f"Default parameters for {filter_type} filter"
+        })
+    except Exception as e:
+        logger.error(f"Error getting filter parameters: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/job-status/<job_id>', methods=['GET'])
 def get_job_status(job_id):
+    """Get job status and progress."""
     try:
         job = job_manager.get_job(job_id)
         if not job:
             return jsonify({"error": "Job not found"}), 404
         
-        # Return only essential fields with download URLs instead of paths
-        simplified_job = {
-            "job_id": job.get("job_id"),
-            "status": job.get("status"),
+        # Add system info
+        memory = psutil.virtual_memory()
+        
+        response = {
+            "job_id": job_id,
+            "status": job["status"],
             "progress": job.get("progress", 0),
-            "error": job.get("error")
+            "error": job.get("error"),
+            "status_message": job.get("status_message", "Processing..."),
+            "processing_info": job.get("processing_info", {}),
+            "system_status": {
+                "memory_usage_percent": memory.percent,
+                "cpu_cores_available": psutil.cpu_count(),
+                "workers": optimal_workers
+            }
         }
         
-        # Add download URLs if job is completed
-        if job.get("status") == "completed":
+        # Add download URLs if completed
+        if job["status"] == "completed":
             if job.get("output_path"):
-                simplified_job["video_download_url"] = f"/download/{job_id}"
+                response["video_download_url"] = f"/download/{job_id}"
             if job.get("subtitle_path"):
-                simplified_job["subtitle_download_url"] = f"/download-subtitles/{job_id}"
+                response["subtitle_download_url"] = f"/download-subtitles/{job_id}"
         
-        return jsonify(simplified_job)
+        return jsonify(response)
         
     except Exception as e:
+        logger.error(f"Error getting job status: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/download/<job_id>', methods=['GET'])
 def download_result(job_id):
+    """Download processed video file."""
     try:
         job = job_manager.get_job(job_id)
         if not job:
@@ -279,10 +548,12 @@ def download_result(job_id):
         return send_file(job['output_path'], as_attachment=True)
         
     except Exception as e:
+        logger.error(f"Download error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/download-subtitles/<job_id>', methods=['GET'])
 def download_subtitles(job_id):
+    """Download subtitle file."""
     try:
         job = job_manager.get_job(job_id)
         if not job:
@@ -292,7 +563,7 @@ def download_subtitles(job_id):
             return jsonify({"error": "Job not completed yet"}), 400
         
         if 'subtitle_path' not in job or not job['subtitle_path']:
-            return jsonify({"error": "No subtitle file available - set return_subtitles_file: true in request"}), 404
+            return jsonify({"error": "No subtitle file available"}), 404
         
         if not os.path.exists(job['subtitle_path']):
             return jsonify({"error": "Subtitle file not found"}), 404
@@ -300,44 +571,171 @@ def download_subtitles(job_id):
         return send_file(job['subtitle_path'], as_attachment=True, download_name=f"{job_id}_subtitles.srt")
         
     except Exception as e:
+        logger.error(f"Subtitle download error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# Async processing functions
-def process_subtitle_job(job_id, settings):
-    video_path = None
+@app.route('/admin/cleanup', methods=['POST'])
+def cleanup_all():
+    """Comprehensive cleanup endpoint."""
     try:
-        job_manager.update_job_status(job_id, "processing")
+        logger.info("🧹 Starting cleanup...")
+        
+        cleanup_stats = {
+            "jobs_removed": 0,
+            "temp_files_removed": 0,
+            "upload_files_removed": 0,
+            "static_files_removed": 0,
+            "total_size_freed": 0
+        }
+        
+        # Clean up all directories
+        for dir_name in ['jobs', 'temp', 'uploads', 'static']:
+            if os.path.exists(dir_name):
+                for file_name in os.listdir(dir_name):
+                    file_path = os.path.join(dir_name, file_name)
+                    if os.path.isfile(file_path):
+                        try:
+                            file_size = os.path.getsize(file_path)
+                            os.remove(file_path)
+                            cleanup_stats[f"{dir_name}_files_removed"] += 1
+                            cleanup_stats["total_size_freed"] += file_size
+                        except Exception as e:
+                            logger.warning(f"Could not remove {file_path}: {e}")
+        
+        # Format size
+        def format_size(bytes_size):
+            for unit in ['B', 'KB', 'MB', 'GB']:
+                if bytes_size < 1024.0:
+                    return f"{bytes_size:.2f} {unit}"
+                bytes_size /= 1024.0
+            return f"{bytes_size:.2f} TB"
+        
+        cleanup_stats["total_size_freed_formatted"] = format_size(cleanup_stats["total_size_freed"])
+        
+        logger.info(f"🧹 Cleanup completed! Freed {cleanup_stats['total_size_freed_formatted']}")
+        
+        return jsonify({
+            "status": "success",
+            "message": "Cleanup completed",
+            "timestamp": datetime.now().isoformat(),
+            "cleanup_stats": cleanup_stats
+        })
+        
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# Background job processors
+def process_generate_subtitles_job(job_id, settings):
+    """Generate subtitles only."""
+    video_path = None
+    start_time = time.time()
+    
+    try:
+        job_manager.update_job_status(job_id, "processing", 10, "🚀 Starting subtitle generation...")
         
         # Download video
+        job_manager.update_job_status(job_id, "processing", 15, "📥 Downloading video...")
         video_url = settings['url']
         video_path = download_file(video_url, 'temp', f"{job_id}_input.mp4")
+        job_manager.update_job_status(job_id, "processing", 25, "✅ Video downloaded")
         
-        # Generate subtitles using Whisper
+        # Progress callback
+        def update_progress(progress, message):
+            mapped_progress = 25 + int((progress / 100) * 65)
+            job_manager.update_job_status(job_id, "processing", mapped_progress, message)
+        
+        # Generate subtitles with tiny model
+        job_manager.update_job_status(job_id, "processing", 30, "🎙️ Generating subtitles with Whisper tiny...")
+        subtitle_data = subtitle_service.generate_subtitles(
+            video_path,
+            settings['language'],
+            settings.get('timing_offset', 0.0)
+        )
+        
+        # Save subtitles
+        job_manager.update_job_status(job_id, "processing", 95, "💾 Saving subtitles...")
+        subtitle_path = job_manager.save_project_subtitles(
+            settings['project_id'], 
+            subtitle_data, 
+            settings['url']
+        )
+        
+        if not subtitle_path:
+            raise Exception("Failed to save project subtitles")
+        
+        processing_time = time.time() - start_time
+        job_manager.update_job_status(job_id, "completed", 100, f"✅ Subtitles generated in {processing_time:.1f}s")
+        
+        # Update job with results
+        job = job_manager.get_job(job_id)
+        job['subtitle_path'] = subtitle_path
+        job['processing_time'] = processing_time
+        job['subtitle_count'] = len(subtitle_data)
+        job['model_used'] = 'tiny'
+        job_manager._save_job(job)
+        
+        logger.info(f"✅ Subtitle generation completed for project {settings['project_id']} in {processing_time:.1f}s")
+        
+    except Exception as e:
+        processing_time = time.time() - start_time
+        error_msg = f"❌ Subtitle generation failed: {str(e)}"
+        logger.error(f"{error_msg} (after {processing_time:.1f}s)")
+        job_manager.update_job_status(job_id, "failed", None, error_msg)
+        
+        job = job_manager.get_job(job_id)
+        if job:
+            job['error'] = str(e)
+            job['processing_time'] = processing_time
+            job_manager._save_job(job)
+    
+    finally:
+        # Cleanup
+        if video_path and os.path.exists(video_path):
+            try:
+                os.remove(video_path)
+            except:
+                pass
+
+def process_subtitle_job(job_id, settings):
+    """Add subtitles to video."""
+    video_path = None
+    start_time = time.time()
+    
+    try:
+        job_manager.update_job_status(job_id, "processing", 10, "🚀 Starting subtitle processing...")
+        
+        # Download video
+        job_manager.update_job_status(job_id, "processing", 15, "📥 Downloading video...")
+        video_url = settings['url']
+        video_path = download_file(video_url, 'temp', f"{job_id}_input.mp4")
+        job_manager.update_job_status(job_id, "processing", 30, "✅ Video downloaded")
+        
+        # Generate subtitles with tiny model
+        job_manager.update_job_status(job_id, "processing", 35, "🎙️ Generating subtitles...")
         subtitle_data = subtitle_service.generate_subtitles(
             video_path, 
             settings['language'],
             settings.get('timing_offset', 0.0)
         )
         
-        # Analyze timing for potential issues
-        timing_analysis = subtitle_service.analyze_timing_gaps(subtitle_data)
+        job_manager.update_job_status(job_id, "processing", 70, "🎬 Adding subtitles to video...")
         
         # Create video with subtitles
         output_path = f"temp/{job_id}_output.mp4"
-        word_mode = settings.get('word_level_mode', 'off')
-        print(f"🎯 Processing with {word_mode} mode")
+        word_mode = settings.get('word_level_mode', 'karaoke')
         
         video_service.add_subtitles_to_video(
             video_path,
             subtitle_data,
             output_path,
-            {**settings['settings'], **settings.get('word_level_settings', {})},
+            settings['settings'],
             word_mode
         )
         
-        # Verify output video was actually created
+        # Verify output
         if not os.path.exists(output_path):
-            raise Exception(f"Video processing failed - output file not created: {output_path}")
+            raise Exception(f"Video processing failed - output file not created")
         
         # Handle subtitle file return
         result = {"output_path": output_path}
@@ -346,11 +744,15 @@ def process_subtitle_job(job_id, settings):
             subtitle_service.save_subtitle_file(subtitle_data, subtitle_path)
             result["subtitle_path"] = subtitle_path
         
+        processing_time = time.time() - start_time
+        job_manager.update_job_status(job_id, "completed", 100, f"✅ Completed in {processing_time:.1f}s")
+        
         job_manager.complete_job(job_id, result)
         
     except Exception as e:
+        processing_time = time.time() - start_time
         error_message = f"Error processing subtitles: {str(e)}"
-        print(f"Job {job_id} failed: {error_message}")
+        logger.error(f"Job {job_id} failed: {error_message}")
         job_manager.fail_job(job_id, error_message)
         
         # Clean up partial files on failure
@@ -363,36 +765,33 @@ def process_subtitle_job(job_id, settings):
             if os.path.exists(file_path):
                 try:
                     os.remove(file_path)
-                    print(f"Cleaned up partial file: {file_path}")
-                except Exception as cleanup_error:
-                    print(f"Warning: Could not cleanup {file_path}: {cleanup_error}")
+                except:
+                    pass
 
 def process_split_job(job_id, data):
+    """Split video by time range."""
+    video_path = None
+    start_time = time.time()
+    
     try:
-        job_manager.update_job_status(job_id, "processing")
+        job_manager.update_job_status(job_id, "processing", 10, "🚀 Starting video splitting...")
         
-        # Get video path - either from URL or previous job
+        # Get video path
         if 'url' in data:
-            # Download video from URL
+            job_manager.update_job_status(job_id, "processing", 15, "📥 Downloading video...")
             video_url = data['url']
             video_path = download_file(video_url, 'temp', f"{job_id}_input.mp4")
+            job_manager.update_job_status(job_id, "processing", 30, "✅ Video downloaded")
         elif 'job_id' in data:
-            # Use output from previous job
             previous_job = job_manager.get_job(data['job_id'])
-            if not previous_job:
-                raise Exception(f"Previous job not found: {data['job_id']}")
+            if not previous_job or previous_job['status'] != 'completed':
+                raise Exception(f"Previous job not completed: {data['job_id']}")
             
-            if previous_job['status'] != 'completed':
-                raise Exception(f"Previous job not completed: {data['job_id']} (status: {previous_job['status']})")
-            
-            if 'output_path' not in previous_job:
-                raise Exception(f"Previous job has no output file: {data['job_id']}")
-            
-            previous_output_path = previous_job['output_path']
-            if not os.path.exists(previous_output_path):
-                raise Exception(f"Previous job output file not found: {previous_output_path}")
-            
-            video_path = previous_output_path
+            video_path = previous_job.get('output_path')
+            if not video_path or not os.path.exists(video_path):
+                raise Exception(f"Previous job output file not found")
+        
+        job_manager.update_job_status(job_id, "processing", 50, "✂️ Splitting video...")
         
         # Split video
         output_path = f"temp/{job_id}_split.mp4"
@@ -403,37 +802,77 @@ def process_split_job(job_id, data):
             output_path
         )
         
+        processing_time = time.time() - start_time
+        job_manager.update_job_status(job_id, "completed", 100, f"✅ Split completed in {processing_time:.1f}s")
+        
         job_manager.complete_job(job_id, {"output_path": output_path})
         
     except Exception as e:
+        processing_time = time.time() - start_time
         job_manager.fail_job(job_id, str(e))
+    
+    finally:
+        if 'url' in data and video_path and os.path.exists(video_path):
+            try:
+                os.remove(video_path)
+            except:
+                pass
 
 def process_join_job(job_id, data):
+    """Join multiple videos."""
+    video_paths = []
+    start_time = time.time()
+    
     try:
-        job_manager.update_job_status(job_id, "processing")
+        job_manager.update_job_status(job_id, "processing", 10, "🚀 Starting video joining...")
         
         # Download all videos
-        video_paths = []
+        total_videos = len(data['urls'])
         for i, url in enumerate(data['urls']):
+            progress = 10 + (i * 60 // total_videos)
+            job_manager.update_job_status(job_id, "processing", progress, f"📥 Downloading video {i+1}/{total_videos}...")
             video_path = download_file(url, 'temp', f"{job_id}_input_{i}.mp4")
             video_paths.append(video_path)
+        
+        job_manager.update_job_status(job_id, "processing", 75, "🔗 Joining videos...")
         
         # Join videos
         output_path = f"temp/{job_id}_joined.mp4"
         video_service.join_videos(video_paths, output_path)
         
+        processing_time = time.time() - start_time
+        job_manager.update_job_status(job_id, "completed", 100, f"✅ Joined in {processing_time:.1f}s")
+        
         job_manager.complete_job(job_id, {"output_path": output_path})
         
     except Exception as e:
+        processing_time = time.time() - start_time
         job_manager.fail_job(job_id, str(e))
+    
+    finally:
+        for video_path in video_paths:
+            if video_path and os.path.exists(video_path):
+                try:
+                    os.remove(video_path)
+                except:
+                    pass
 
 def process_music_job(job_id, data):
+    """Add music to video."""
+    video_path = None
+    music_path = None
+    start_time = time.time()
+    
     try:
-        job_manager.update_job_status(job_id, "processing")
+        job_manager.update_job_status(job_id, "processing", 10, "🚀 Starting music addition...")
         
         # Download video and music
+        job_manager.update_job_status(job_id, "processing", 15, "📥 Downloading video...")
         video_path = download_file(data['video_url'], 'temp', f"{job_id}_video.mp4")
+        job_manager.update_job_status(job_id, "processing", 30, "📥 Downloading music...")
         music_path = download_file(data['music_url'], 'temp', f"{job_id}_music.mp3")
+        
+        job_manager.update_job_status(job_id, "processing", 50, "🎵 Adding music to video...")
         
         # Add music to video
         output_path = f"temp/{job_id}_with_music.mp4"
@@ -444,123 +883,202 @@ def process_music_job(job_id, data):
             data['settings']
         )
         
+        processing_time = time.time() - start_time
+        job_manager.update_job_status(job_id, "completed", 100, f"✅ Music added in {processing_time:.1f}s")
+        
         job_manager.complete_job(job_id, {"output_path": output_path})
         
     except Exception as e:
+        processing_time = time.time() - start_time
         job_manager.fail_job(job_id, str(e))
+    
+    finally:
+        for file_path in [video_path, music_path]:
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
 
-@app.route('/admin/cleanup', methods=['POST'])
-def cleanup_all():
-    """
-    Comprehensive cleanup endpoint - removes ALL jobs and files.
-    This will clean up completed, failed, and pending jobs along with all temp files.
-    """
+def process_voice_filter_job(job_id, data):
+    """Apply voice filter to audio/video."""
+    input_path = None
+    start_time = time.time()
+    
     try:
-        print("🧹 Starting comprehensive cleanup...")
+        job_manager.update_job_status(job_id, "processing", 10, "🚀 Starting voice filter processing...")
         
-        cleanup_stats = {
-            "jobs_removed": 0,
-            "temp_files_removed": 0,
-            "upload_files_removed": 0,
-            "static_files_removed": 0,
-            "total_size_freed": 0,
-            "directories_cleaned": []
-        }
+        # Download input file
+        job_manager.update_job_status(job_id, "processing", 15, "📥 Downloading input file...")
+        input_path = download_file(data['url'], 'temp', f"{job_id}_input")
+        job_manager.update_job_status(job_id, "processing", 30, "✅ File downloaded")
         
-        # 1. Clean up all job files
-        jobs_dir = 'jobs'
-        if os.path.exists(jobs_dir):
-            for job_file in os.listdir(jobs_dir):
-                job_path = os.path.join(jobs_dir, job_file)
-                if os.path.isfile(job_path):
-                    try:
-                        file_size = os.path.getsize(job_path)
-                        os.remove(job_path)
-                        cleanup_stats["jobs_removed"] += 1
-                        cleanup_stats["total_size_freed"] += file_size
-                        print(f"Removed job file: {job_path}")
-                    except Exception as e:
-                        print(f"Warning: Could not remove job file {job_path}: {e}")
-            cleanup_stats["directories_cleaned"].append(jobs_dir)
+        # Determine output format based on input
+        input_ext = os.path.splitext(input_path)[1].lower()
+        if input_ext in ['.mp4', '.avi', '.mov', '.mkv']:
+            output_ext = '.mp4'  # Video output
+        else:
+            output_ext = '.wav'  # Audio output
         
-        # 2. Clean up all temp files
-        temp_dir = 'temp'
-        if os.path.exists(temp_dir):
-            for temp_file in os.listdir(temp_dir):
-                temp_path = os.path.join(temp_dir, temp_file)
-                if os.path.isfile(temp_path):
-                    try:
-                        file_size = os.path.getsize(temp_path)
-                        os.remove(temp_path)
-                        cleanup_stats["temp_files_removed"] += 1
-                        cleanup_stats["total_size_freed"] += file_size
-                        print(f"Removed temp file: {temp_path}")
-                    except Exception as e:
-                        print(f"Warning: Could not remove temp file {temp_path}: {e}")
-            cleanup_stats["directories_cleaned"].append(temp_dir)
+        output_path = f"temp/{job_id}_filtered{output_ext}"
         
-        # 3. Clean up all upload files
-        uploads_dir = 'uploads'
-        if os.path.exists(uploads_dir):
-            for upload_file in os.listdir(uploads_dir):
-                upload_path = os.path.join(uploads_dir, upload_file)
-                if os.path.isfile(upload_path):
-                    try:
-                        file_size = os.path.getsize(upload_path)
-                        os.remove(upload_path)
-                        cleanup_stats["upload_files_removed"] += 1
-                        cleanup_stats["total_size_freed"] += file_size
-                        print(f"Removed upload file: {upload_path}")
-                    except Exception as e:
-                        print(f"Warning: Could not remove upload file {upload_path}: {e}")
-            cleanup_stats["directories_cleaned"].append(uploads_dir)
+        job_manager.update_job_status(job_id, "processing", 40, f"🎵 Applying {data['filter_type']} filter...")
         
-        # 4. Clean up static files (if any)
-        static_dir = 'static'
-        if os.path.exists(static_dir):
-            for static_file in os.listdir(static_dir):
-                static_path = os.path.join(static_dir, static_file)
-                if os.path.isfile(static_path):
-                    try:
-                        file_size = os.path.getsize(static_path)
-                        os.remove(static_path)
-                        cleanup_stats["static_files_removed"] += 1
-                        cleanup_stats["total_size_freed"] += file_size
-                        print(f"Removed static file: {static_path}")
-                    except Exception as e:
-                        print(f"Warning: Could not remove static file {static_path}: {e}")
-            cleanup_stats["directories_cleaned"].append(static_dir)
+        # Apply voice filter
+        audio_service.apply_voice_filter(
+            input_path,
+            output_path,
+            data['filter_type']
+        )
         
-        # Convert bytes to human readable format
-        def format_size(bytes_size):
-            for unit in ['B', 'KB', 'MB', 'GB']:
-                if bytes_size < 1024.0:
-                    return f"{bytes_size:.2f} {unit}"
-                bytes_size /= 1024.0
-            return f"{bytes_size:.2f} TB"
+        # Verify output
+        if not os.path.exists(output_path):
+            raise Exception("Voice filter processing failed - output file not created")
         
-        cleanup_stats["total_size_freed_formatted"] = format_size(cleanup_stats["total_size_freed"])
+        processing_time = time.time() - start_time
+        job_manager.update_job_status(job_id, "completed", 100, f"✅ Filter applied in {processing_time:.1f}s")
         
-        print(f"🧹 Cleanup completed! Freed {cleanup_stats['total_size_freed_formatted']} of disk space")
-        
-        return jsonify({
-            "status": "success",
-            "message": "Comprehensive cleanup completed",
-            "timestamp": datetime.now().isoformat(),
-            "cleanup_stats": cleanup_stats
-        })
+        job_manager.complete_job(job_id, {"output_path": output_path})
         
     except Exception as e:
-        error_message = f"Error during cleanup: {str(e)}"
-        print(f"❌ {error_message}")
-        return jsonify({"error": error_message}), 500
+        processing_time = time.time() - start_time
+        error_message = f"Error applying voice filter: {str(e)}"
+        logger.error(f"Job {job_id} failed: {error_message}")
+        job_manager.fail_job(job_id, error_message)
+        
+        # Clean up partial files on failure
+        cleanup_files = [
+            input_path,
+            f"temp/{job_id}_filtered.mp4",
+            f"temp/{job_id}_filtered.wav"
+        ]
+        for file_path in cleanup_files:
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+    
+    finally:
+        # Clean up input file
+        if input_path and os.path.exists(input_path):
+            try:
+                os.remove(input_path)
+            except:
+                pass
+
+def process_video_filter_job(job_id, data):
+    """Apply video filter to video."""
+    input_path = None
+    start_time = time.time()
+    
+    try:
+        job_manager.update_job_status(job_id, "processing", 10, "🚀 Starting video filter processing...")
+        
+        # Download input video
+        job_manager.update_job_status(job_id, "processing", 15, "📥 Downloading video...")
+        input_path = download_file(data['url'], 'temp', f"{job_id}_input.mp4")
+        job_manager.update_job_status(job_id, "processing", 30, "✅ Video downloaded")
+        
+        output_path = f"temp/{job_id}_filtered.mp4"
+        
+        job_manager.update_job_status(job_id, "processing", 35, f"🎬 Applying {data['filter_type']} filter...")
+        
+        # Apply video filter
+        video_filter_service.apply_video_filter(
+            input_path,
+            output_path,
+            data['filter_type'],
+            data.get('custom_parameters')
+        )
+        
+        # Verify output
+        if not os.path.exists(output_path):
+            raise Exception("Video filter processing failed - output file not created")
+        
+        processing_time = time.time() - start_time
+        job_manager.update_job_status(job_id, "completed", 100, f"✅ Filter applied in {processing_time:.1f}s")
+        
+        job_manager.complete_job(job_id, {"output_path": output_path})
+        
+    except Exception as e:
+        processing_time = time.time() - start_time
+        error_message = f"Error applying video filter: {str(e)}"
+        logger.error(f"Job {job_id} failed: {error_message}")
+        job_manager.fail_job(job_id, error_message)
+        
+        # Clean up partial files on failure
+        cleanup_files = [
+            input_path,
+            f"temp/{job_id}_filtered.mp4"
+        ]
+        for file_path in cleanup_files:
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+    
+    finally:
+        # Clean up input file
+        if input_path and os.path.exists(input_path):
+            try:
+                os.remove(input_path)
+            except:
+                pass
+
+# Background resource monitoring
+def monitor_resources():
+    """Monitor system resources."""
+    while True:
+        try:
+            memory = psutil.virtual_memory()
+            cpu_percent = psutil.cpu_percent(interval=1)
+            
+            # Update stats
+            resource_stats["average_cpu"] = (resource_stats["average_cpu"] + cpu_percent) / 2
+            
+            if memory.percent > resource_stats["peak_memory"] * 100:
+                resource_stats["peak_memory"] = memory.percent / 100
+            
+            # Add warnings for high usage
+            if memory.percent > 90:
+                warning = f"High memory usage: {memory.percent:.1f}%"
+                resource_stats["warnings"].append({
+                    "timestamp": datetime.now().isoformat(),
+                    "type": "memory_high",
+                    "message": warning
+                })
+                
+            # Keep only last 50 warnings
+            if len(resource_stats["warnings"]) > 50:
+                resource_stats["warnings"] = resource_stats["warnings"][-50:]
+                
+        except Exception as e:
+            logger.error(f"Resource monitoring error: {e}")
+        
+        time.sleep(10)  # Check every 10 seconds
 
 if __name__ == '__main__':
     # Create necessary directories
     os.makedirs('temp', exist_ok=True)
     os.makedirs('uploads', exist_ok=True)
     os.makedirs('jobs', exist_ok=True)
+    os.makedirs('static', exist_ok=True)
     
-    # Use port from environment or default to 8080 for Digital Ocean
+    # Start background monitoring
+    monitoring_thread = threading.Thread(target=monitor_resources, daemon=True)
+    monitoring_thread.start()
+    
+    # Use port from environment or default to 8080
     port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    
+    logger.info("🚀 Starting Unified VideoEditor API")
+    logger.info(f"🌐 Port: {port}")
+    logger.info(f"⚡ Workers: {optimal_workers}")
+    logger.info(f"🎙️ Whisper Model: tiny (fixed)")
+    
+    try:
+        app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    finally:
+        executor.shutdown(wait=True)

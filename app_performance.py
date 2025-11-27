@@ -806,6 +806,109 @@ def split_video():
         logger.error(f"Error in split_video: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/add-music', methods=['POST'])
+def add_music():
+    """High-performance music addition to video."""
+    try:
+        data = request.get_json()
+        
+        # Validate required fields
+        required_fields = ['video_url', 'music_url']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({"error": f"Missing required field: {field}"}), 400
+        
+        # Check system resources
+        memory = psutil.virtual_memory()
+        memory_threshold = perf_config.get_resource_limits()['max_memory_percent']
+        
+        if memory.percent > memory_threshold:
+            logger.warning(f"Processing music addition with high memory usage: {memory.percent:.1f}%")
+        
+        job_id = str(uuid.uuid4())
+        
+        # Optional settings with performance considerations
+        settings = {
+            "volume": data.get('volume', 0.5),  # Music volume (0.0 to 1.0)
+            "fade_in": data.get('fade_in', 0),  # Fade in duration in seconds
+            "fade_out": data.get('fade_out', 0),  # Fade out duration in seconds
+            "loop_music": data.get('loop_music', False),  # Loop music to match video length
+            "performance_mode": resource_stats.get("performance_mode", "AUTO")
+        }
+        
+        job_data = {**data, "settings": settings}
+        
+        job_manager.create_job(job_id, "add_music", "pending", job_data)
+        
+        # Update resource stats
+        resource_stats["job_count"] += 1
+        
+        # Submit high-performance music job
+        future = executor.submit(process_music_job_performance, job_id, job_data)
+        
+        return jsonify({
+            "job_id": job_id,
+            "status": "pending",
+            "message": "High-performance music addition started",
+            "performance_mode": resource_stats["performance_mode"],
+            "estimated_workers": max_workers,
+            "check_status_url": f"/job-status/{job_id}"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in add_music: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/join-videos', methods=['POST'])
+def join_videos():
+    """High-performance video joining."""
+    try:
+        data = request.get_json()
+        
+        # Validate required fields
+        if not data or 'urls' not in data or not isinstance(data['urls'], list):
+            return jsonify({"error": "Missing required field: urls (must be an array)"}), 400
+        
+        if len(data['urls']) < 2:
+            return jsonify({"error": "At least 2 video URLs are required"}), 400
+        
+        # Check system resources
+        memory = psutil.virtual_memory()
+        memory_threshold = perf_config.get_resource_limits()['max_memory_percent']
+        
+        if memory.percent > memory_threshold:
+            logger.warning(f"Processing video join with high memory usage: {memory.percent:.1f}%")
+        
+        job_id = str(uuid.uuid4())
+        
+        # Add performance mode to data
+        processed_data = {
+            **data,
+            "performance_mode": resource_stats.get("performance_mode", "AUTO")
+        }
+        
+        job_manager.create_job(job_id, "join_videos", "pending", processed_data)
+        
+        # Update resource stats
+        resource_stats["job_count"] += 1
+        
+        # Submit high-performance joining job
+        future = executor.submit(process_join_job_performance, job_id, processed_data)
+        
+        return jsonify({
+            "job_id": job_id,
+            "status": "pending", 
+            "message": "High-performance video joining started",
+            "performance_mode": resource_stats["performance_mode"],
+            "estimated_workers": max_workers,
+            "video_count": len(data['urls']),
+            "check_status_url": f"/job-status/{job_id}"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in join_videos: {e}")
+        return jsonify({"error": str(e)}), 500
+
 def parse_time_to_seconds(time_input):
     """Parse various time formats to seconds."""
     import re
@@ -937,6 +1040,158 @@ def process_split_job_performance(job_id, data):
                 os.remove(video_path)
             except:
                 pass
+
+def process_music_job_performance(job_id, data):
+    """High-performance music addition to video."""
+    video_path = None
+    music_path = None
+    start_time = time.time()
+    
+    try:
+        job_manager.update_job_status(job_id, "processing", 10, "🚀 Starting high-performance music addition...")
+        
+        # Download video and music files
+        job_manager.update_job_status(job_id, "processing", 15, "📥 Downloading video...")
+        video_path = download_file(data['video_url'], 'temp', f"{job_id}_video.mp4")
+        job_manager.update_job_status(job_id, "processing", 30, "📥 Downloading music...")
+        music_path = download_file(data['music_url'], 'temp', f"{job_id}_music.mp3")
+        
+        job_manager.update_job_status(job_id, "processing", 45, "✅ Downloads completed")
+        
+        # Progress callback for music addition
+        def music_progress(progress, message):
+            # Map music processing to 45-95% range  
+            mapped_progress = 45 + int((progress / 100) * 50)
+            job_manager.update_job_status(job_id, "processing", mapped_progress, f"🎵 {message}")
+        
+        job_manager.update_job_status(job_id, "processing", 50, "🎵 Adding music to video...")
+        
+        # Add music using optimized video service
+        output_path = f"temp/{job_id}_with_music.mp4"
+        video_service.add_music_to_video(
+            video_path,
+            music_path,
+            output_path,
+            data['settings']
+        )
+        
+        job_manager.update_job_status(job_id, "processing", 95, "✅ Music addition completed")
+        
+        # Verify output
+        if not os.path.exists(output_path):
+            raise Exception(f"Music addition failed - output file not created: {output_path}")
+        
+        processing_time = time.time() - start_time
+        job_manager.update_job_status(job_id, "completed", 100, f"✅ Music added in {processing_time:.1f}s")
+        
+        # Update job with results
+        job = job_manager.get_job(job_id)
+        job['output_path'] = output_path
+        job['processing_time'] = processing_time
+        job['music_settings'] = data['settings']
+        job_manager._save_job(job)
+        
+        logger.info(f"✅ Music job {job_id} completed in {processing_time:.1f}s")
+        
+    except Exception as e:
+        processing_time = time.time() - start_time
+        error_msg = f"❌ Music addition failed: {str(e)}"
+        logger.error(f"{error_msg} (after {processing_time:.1f}s)")
+        job_manager.update_job_status(job_id, "failed", None, error_msg)
+        
+        # Update job with error
+        job = job_manager.get_job(job_id)
+        if job:
+            job['error'] = str(e)
+            job['processing_time'] = processing_time
+            job_manager._save_job(job)
+    
+    finally:
+        # Cleanup downloaded files
+        for file_path in [video_path, music_path]:
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+
+def process_join_job_performance(job_id, data):
+    """High-performance video joining."""
+    video_paths = []
+    start_time = time.time()
+    
+    try:
+        job_manager.update_job_status(job_id, "processing", 10, "🚀 Starting high-performance video joining...")
+        
+        # Download all videos with progress tracking
+        total_videos = len(data['urls'])
+        download_progress_per_video = 60 / total_videos  # 10-70% for downloads
+        
+        for i, url in enumerate(data['urls']):
+            progress_start = 10 + (i * download_progress_per_video)
+            progress_end = 10 + ((i + 1) * download_progress_per_video)
+            
+            job_manager.update_job_status(job_id, "processing", int(progress_start), f"📥 Downloading video {i+1}/{total_videos}...")
+            video_path = download_file(url, 'temp', f"{job_id}_input_{i}.mp4")
+            video_paths.append(video_path)
+            job_manager.update_job_status(job_id, "processing", int(progress_end), f"✅ Video {i+1}/{total_videos} downloaded")
+        
+        job_manager.update_job_status(job_id, "processing", 70, "✅ All videos downloaded")
+        
+        # Progress callback for video joining
+        def join_progress(progress, message):
+            # Map joining to 70-95% range
+            mapped_progress = 70 + int((progress / 100) * 25)
+            job_manager.update_job_status(job_id, "processing", mapped_progress, f"🔗 {message}")
+        
+        job_manager.update_job_status(job_id, "processing", 75, "🔗 Joining videos...")
+        
+        # Join videos using optimized video service
+        output_path = f"temp/{job_id}_joined.mp4"
+        video_service.join_videos(video_paths, output_path)
+        
+        job_manager.update_job_status(job_id, "processing", 95, "✅ Video joining completed")
+        
+        # Verify output
+        if not os.path.exists(output_path):
+            raise Exception(f"Video joining failed - output file not created: {output_path}")
+        
+        processing_time = time.time() - start_time
+        job_manager.update_job_status(job_id, "completed", 100, f"✅ Videos joined in {processing_time:.1f}s")
+        
+        # Update job with results
+        job = job_manager.get_job(job_id)
+        job['output_path'] = output_path
+        job['processing_time'] = processing_time
+        job['join_info'] = {
+            "video_count": len(video_paths),
+            "source_urls": data['urls']
+        }
+        job_manager._save_job(job)
+        
+        logger.info(f"✅ Join job {job_id} completed in {processing_time:.1f}s")
+        
+    except Exception as e:
+        processing_time = time.time() - start_time
+        error_msg = f"❌ Video joining failed: {str(e)}"
+        logger.error(f"{error_msg} (after {processing_time:.1f}s)")
+        job_manager.update_job_status(job_id, "failed", None, error_msg)
+        
+        # Update job with error
+        job = job_manager.get_job(job_id)
+        if job:
+            job['error'] = str(e)
+            job['processing_time'] = processing_time
+            job_manager._save_job(job)
+    
+    finally:
+        # Cleanup downloaded files
+        for file_path in video_paths:
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
 
 # Start background monitoring
 monitoring_thread = threading.Thread(target=monitor_resources_performance, daemon=True)

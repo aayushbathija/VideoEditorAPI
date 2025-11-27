@@ -213,6 +213,70 @@ def set_performance_mode():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/generate-subtitles', methods=['POST'])
+def generate_subtitles():
+    """Generate subtitles only without adding to video (optimized for low resources)."""
+    try:
+        data = request.get_json()
+        
+        if not data or 'url' not in data:
+            return jsonify({"error": "Missing required 'url' parameter"}), 400
+        
+        # Check system resources before accepting job
+        memory = psutil.virtual_memory()
+        if memory.percent > MEMORY_CRITICAL_THRESHOLD * 100:
+            return jsonify({
+                "error": "System memory critically low. Please try again later.",
+                "memory_usage": f"{memory.percent:.1f}%"
+            }), 503
+        
+        job_id = str(uuid.uuid4())
+        project_id = data.get('project_id', str(uuid.uuid4()))
+        
+        # Check if subtitles already exist for this project
+        existing_subtitles = job_manager.get_project_subtitles(project_id)
+        if existing_subtitles:
+            return jsonify({
+                "message": "Subtitles already exist for this project",
+                "project_id": project_id,
+                "created_at": existing_subtitles["created_at"],
+                "subtitle_count": len(existing_subtitles["subtitle_data"]),
+                "status": "already_exists"
+            })
+        
+        # Settings for subtitle generation only
+        generation_settings = {
+            "project_id": project_id,
+            "url": data['url'],
+            "language": data.get("language", "en"),
+            "timing_offset": data.get("timing_offset", 0.0),
+            "performance_mode": "OPTIMIZED"  # Force optimized mode
+        }
+        
+        # Create job for subtitle generation
+        job_manager.create_job(job_id, "generate_subtitles", "pending", generation_settings)
+        
+        # Update resource stats
+        resource_stats["job_count"] += 1
+        
+        # Submit subtitle generation job
+        future = executor.submit(process_generate_subtitles_job_optimized, job_id, generation_settings)
+        
+        return jsonify({
+            "job_id": job_id,
+            "project_id": project_id,
+            "project_id_generated": project_id != data.get('project_id'),
+            "status": "pending",
+            "message": "Optimized subtitle generation started",
+            "performance_mode": "OPTIMIZED",
+            "estimated_workers": optimal_workers,
+            "check_status_url": f"/job-status/{job_id}"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error starting subtitle generation job: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Enhanced health check with resource information."""
@@ -838,6 +902,99 @@ def cleanup_all():
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
         return jsonify({"error": str(e)}), 500
+
+def process_generate_subtitles_job_optimized(job_id, settings):
+    """Generate subtitles only and save them by project_id (optimized version)."""
+    video_path = None
+    start_time = time.time()
+    
+    try:
+        job_manager.update_job_status(job_id, "processing", 10, "🚀 Starting optimized subtitle generation...")
+        
+        # Download video with memory monitoring
+        job_manager.update_job_status(job_id, "processing", 15, "📥 Downloading video...")
+        video_url = settings['url']
+        video_path = download_file(video_url, 'temp', f"{job_id}_input.mp4")
+        job_manager.update_job_status(job_id, "processing", 25, "✅ Video download completed")
+        
+        # Memory check before subtitle generation
+        memory = psutil.virtual_memory()
+        if memory.percent > MEMORY_CRITICAL_THRESHOLD * 100:
+            raise Exception(f"Insufficient memory for processing: {memory.percent:.1f}% used")
+        
+        # Progress callback for subtitle generation
+        def update_progress(progress, message):
+            # Map subtitle generation to 25-90% range
+            mapped_progress = 25 + int((progress / 100) * 65)
+            job_manager.update_job_status(job_id, "processing", mapped_progress, message)
+        
+        # Generate subtitles using optimized service
+        job_manager.update_job_status(job_id, "processing", 30, "🎙️ Generating subtitles with optimized settings...")
+        subtitle_data = subtitle_service.generate_subtitles(
+            video_path,
+            settings['language'],
+            settings.get('timing_offset', 0.0),
+            progress_callback=update_progress
+        )
+        
+        # Save subtitles for the project
+        job_manager.update_job_status(job_id, "processing", 95, "💾 Saving subtitles...")
+        subtitle_path = job_manager.save_project_subtitles(
+            settings['project_id'], 
+            subtitle_data, 
+            settings['url']
+        )
+        
+        if not subtitle_path:
+            raise Exception("Failed to save project subtitles")
+        
+        # Update job completion
+        processing_time = time.time() - start_time
+        job_manager.update_job_status(job_id, "completed", 100, f"✅ Subtitles generated and saved in {processing_time:.1f}s")
+        
+        # Update job with subtitle path and stats
+        job = job_manager.get_job(job_id)
+        job['subtitle_path'] = subtitle_path
+        job['processing_time'] = processing_time
+        job['subtitle_count'] = len(subtitle_data)
+        job['performance_mode'] = 'OPTIMIZED'
+        job_manager._save_job(job)
+        
+        logger.info(f"✅ Optimized subtitle generation completed for project {settings['project_id']} in {processing_time:.1f}s")
+        
+        # Update resource stats
+        resource_stats["job_count"] = max(0, resource_stats["job_count"])
+        
+    except Exception as e:
+        processing_time = time.time() - start_time
+        error_msg = f"❌ Optimized subtitle generation failed: {str(e)}"
+        logger.error(f"{error_msg} (after {processing_time:.1f}s)")
+        job_manager.update_job_status(job_id, "failed", None, error_msg)
+        
+        # Update job with error
+        job = job_manager.get_job(job_id)
+        if job:
+            job['error'] = str(e)
+            job['processing_time'] = processing_time
+            job['performance_mode'] = 'OPTIMIZED'
+            job_manager._save_job(job)
+    
+    finally:
+        # Cleanup video file and force memory cleanup
+        if video_path and os.path.exists(video_path):
+            try:
+                os.remove(video_path)
+                logger.info(f"Cleaned up input video: {video_path}")
+            except Exception as cleanup_error:
+                logger.warning(f"Could not cleanup video file {video_path}: {cleanup_error}")
+        
+        # Force memory cleanup for optimized mode
+        if hasattr(subtitle_service, '_cleanup_memory'):
+            subtitle_service._cleanup_memory()
+        
+        # Python garbage collection
+        import gc
+        gc.collect()
 
 if __name__ == '__main__':
     # Create necessary directories
