@@ -1040,30 +1040,58 @@ def process_voice_filter_job(job_id, data):
     try:
         job_manager.update_job_status(job_id, "processing", 10, "🚀 Starting voice filter processing...")
         
-        # Download input file
+        # Download input file first
         job_manager.update_job_status(job_id, "processing", 15, "📥 Downloading input file...")
         
-        # Detect input file type from URL to preserve extension
-        import urllib.parse
-        parsed_url = urllib.parse.urlparse(data['url'])
-        url_path = parsed_url.path.lower()
+        # Download as temporary file first to detect actual type
+        temp_input_path = download_file(data['url'], 'temp', f"{job_id}_temp_input")
         
-        # Determine file extension from URL
-        if any(url_path.endswith(ext) for ext in ['.mp4', '.avi', '.mov', '.mkv']):
-            # Video file - download with .mp4 extension
-            input_filename = f"{job_id}_input.mp4"
-            output_ext = '.mp4'
-        else:
-            # Audio file - download with generic extension
+        # Detect actual file type using file command or moviepy
+        job_manager.update_job_status(job_id, "processing", 25, "🔍 Detecting file type...")
+        
+        try:
+            # Try to detect if it's a video file using moviepy
+            import moviepy.editor as mp
+            try:
+                test_video = mp.VideoFileClip(temp_input_path)
+                # If we can get video properties, it's a video file
+                is_video_file = hasattr(test_video, 'fps') and test_video.fps is not None
+                test_video.close()
+                logger.info(f"Video detection: fps check passed = {is_video_file}")
+            except Exception as e:
+                # If moviepy fails to load as video, it's likely audio
+                is_video_file = False
+                logger.info(f"Video detection: moviepy failed ({e}), treating as audio")
+            
+            # Rename file with correct extension based on detection
+            if is_video_file:
+                input_filename = f"{job_id}_input.mp4"
+                output_ext = '.mp4'
+                file_type = "VIDEO"
+            else:
+                input_filename = f"{job_id}_input.wav"
+                output_ext = '.wav'
+                file_type = "AUDIO"
+            
+            input_path = os.path.join('temp', input_filename)
+            
+            # Rename the temp file to correct filename
+            import shutil
+            shutil.move(temp_input_path, input_path)
+            
+            job_manager.update_job_status(job_id, "processing", 30, f"✅ File downloaded and detected as {file_type}")
+            logger.info(f"Voice filter: URL={data['url']}, detected_type={file_type}, output_ext={output_ext}")
+            
+        except Exception as e:
+            logger.error(f"File type detection failed: {e}, defaulting to audio")
+            # Default to audio if detection fails
             input_filename = f"{job_id}_input.wav"
             output_ext = '.wav'
-        
-        input_path = download_file(data['url'], 'temp', input_filename)
-        job_manager.update_job_status(job_id, "processing", 30, "✅ File downloaded")
-        
-        # Verify the detection worked
-        detected_input_ext = os.path.splitext(input_path)[1].lower()
-        logger.info(f"Voice filter: URL={data['url']}, detected_ext={detected_input_ext}, output_ext={output_ext}")
+            input_path = os.path.join('temp', input_filename)
+            
+            # Rename the temp file
+            import shutil
+            shutil.move(temp_input_path, input_path)
         
         output_path = f"temp/{job_id}_filtered{output_ext}"
         
