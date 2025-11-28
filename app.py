@@ -24,6 +24,7 @@ from app.services.job_manager import JobManager
 from app.services.audio_service import AudioService
 from app.services.video_filter_service import VideoFilterService
 from app.services.aspect_ratio_service import AspectRatioService
+from app.services.voiceover_service import VoiceoverService
 from app.utils.download_utils import download_file
 
 # Configure logging
@@ -40,6 +41,7 @@ job_manager = JobManager()
 audio_service = AudioService()
 video_filter_service = VideoFilterService()
 aspect_ratio_service = AspectRatioService()
+voiceover_service = VoiceoverService()
 
 # Auto-detect optimal workers (use all available cores)
 optimal_workers = min(psutil.cpu_count(logical=True), 8)  # Cap at 8 for stability
@@ -587,6 +589,42 @@ def list_scale_modes():
         logger.error(f"Error listing scale modes: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/add-voiceover', methods=['POST'])
+def add_voiceover():
+    """Add voiceover to video with intelligent duration matching."""
+    try:
+        data = request.get_json()
+        
+        # Validate required fields
+        if not data or 'video_url' not in data or 'audio_url' not in data:
+            return jsonify({"error": "Missing required fields: video_url and audio_url"}), 400
+        
+        # Create job
+        job_id = str(uuid.uuid4())
+        job_data = {
+            "job_id": job_id,
+            "operation": "add_voiceover",
+            "video_url": data["video_url"],
+            "audio_url": data["audio_url"],
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # Initialize job status
+        job_manager.create_job(job_id, "add_voiceover", "pending", job_data)
+        
+        # Submit job to executor
+        executor.submit(process_voiceover_job, job_id, job_data)
+        
+        return jsonify({
+            "message": "Voiceover job started",
+            "job_id": job_id,
+            "status_url": f"/job-status/{job_id}"
+        }), 202
+        
+    except Exception as e:
+        logger.error(f"Error starting voiceover job: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/job-status/<job_id>', methods=['GET'])
 def get_job_status(job_id):
     """Get job status and progress."""
@@ -1004,15 +1042,28 @@ def process_voice_filter_job(job_id, data):
         
         # Download input file
         job_manager.update_job_status(job_id, "processing", 15, "📥 Downloading input file...")
-        input_path = download_file(data['url'], 'temp', f"{job_id}_input")
+        
+        # Detect input file type from URL to preserve extension
+        import urllib.parse
+        parsed_url = urllib.parse.urlparse(data['url'])
+        url_path = parsed_url.path.lower()
+        
+        # Determine file extension from URL
+        if any(url_path.endswith(ext) for ext in ['.mp4', '.avi', '.mov', '.mkv']):
+            # Video file - download with .mp4 extension
+            input_filename = f"{job_id}_input.mp4"
+            output_ext = '.mp4'
+        else:
+            # Audio file - download with generic extension
+            input_filename = f"{job_id}_input.wav"
+            output_ext = '.wav'
+        
+        input_path = download_file(data['url'], 'temp', input_filename)
         job_manager.update_job_status(job_id, "processing", 30, "✅ File downloaded")
         
-        # Determine output format based on input
-        input_ext = os.path.splitext(input_path)[1].lower()
-        if input_ext in ['.mp4', '.avi', '.mov', '.mkv']:
-            output_ext = '.mp4'  # Video output
-        else:
-            output_ext = '.wav'  # Audio output
+        # Verify the detection worked
+        detected_input_ext = os.path.splitext(input_path)[1].lower()
+        logger.info(f"Voice filter: URL={data['url']}, detected_ext={detected_input_ext}, output_ext={output_ext}")
         
         output_path = f"temp/{job_id}_filtered{output_ext}"
         
@@ -1181,6 +1232,85 @@ def process_aspect_ratio_job(job_id, data):
                 os.remove(input_path)
             except:
                 pass
+
+def process_voiceover_job(job_id, data):
+    """Process voiceover addition job."""
+    video_path = None
+    audio_path = None
+    start_time = time.time()
+    
+    try:
+        job_manager.update_job_status(job_id, "processing", 5, "🚀 Starting voiceover addition...")
+        
+        # Download video file
+        job_manager.update_job_status(job_id, "processing", 15, "📥 Downloading video...")
+        video_path = download_file(data['video_url'], 'temp', f"{job_id}_video.mp4")
+        job_manager.update_job_status(job_id, "processing", 30, "✅ Video downloaded")
+        
+        # Download audio file
+        job_manager.update_job_status(job_id, "processing", 35, "📥 Downloading audio...")
+        audio_path = download_file(data['audio_url'], 'temp', f"{job_id}_audio.mp3")
+        job_manager.update_job_status(job_id, "processing", 50, "✅ Audio downloaded")
+        
+        # Validate files
+        job_manager.update_job_status(job_id, "processing", 55, "🔍 Validating media files...")
+        voiceover_service.validate_files(video_path, audio_path)
+        
+        # Get media info for duration analysis
+        video_info = voiceover_service.get_media_info(video_path)
+        audio_info = voiceover_service.get_media_info(audio_path)
+        
+        if video_info and audio_info:
+            duration_info = f"Video: {video_info['duration']:.1f}s, Audio: {audio_info['duration']:.1f}s"
+            job_manager.update_job_status(job_id, "processing", 60, f"📊 {duration_info}")
+        
+        output_path = f"temp/{job_id}_with_voiceover.mp4"
+        
+        job_manager.update_job_status(job_id, "processing", 65, "🎤 Adding voiceover with duration matching...")
+        
+        # Apply voiceover
+        voiceover_service.add_voiceover(
+            video_path,
+            audio_path,
+            output_path
+        )
+        
+        # Verify output
+        if not os.path.exists(output_path):
+            raise Exception("Voiceover addition failed - output file not created")
+        
+        processing_time = time.time() - start_time
+        job_manager.update_job_status(job_id, "completed", 100, f"✅ Voiceover added in {processing_time:.1f}s")
+        
+        job_manager.complete_job(job_id, {"output_path": output_path})
+        
+    except Exception as e:
+        processing_time = time.time() - start_time
+        error_message = f"Error adding voiceover: {str(e)}"
+        logger.error(f"Job {job_id} failed: {error_message}")
+        job_manager.fail_job(job_id, error_message)
+        
+        # Clean up partial files on failure
+        cleanup_files = [
+            video_path,
+            audio_path,
+            f"temp/{job_id}_with_voiceover.mp4"
+        ]
+        for file_path in cleanup_files:
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+    
+    finally:
+        # Clean up input files
+        for file_path in [video_path, audio_path]:
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
 
 # Background resource monitoring
 def monitor_resources():
