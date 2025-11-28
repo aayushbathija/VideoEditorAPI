@@ -85,18 +85,31 @@ class AudioService:
         filter_config = self.supported_filters[filter_type]
         logger.info(f"Applying {filter_config['name']} filter to {input_path}")
         
+        # Determine if input is video or audio
+        input_ext = os.path.splitext(input_path)[1].lower()
+        output_ext = os.path.splitext(output_path)[1].lower()
+        is_video_input = input_ext in ['.mp4', '.avi', '.mov', '.mkv']
+        is_video_output = output_ext in ['.mp4', '.avi', '.mov', '.mkv']
+        
         # Create temporary files for processing
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_audio_path = os.path.join(temp_dir, "temp_audio.wav")
             filtered_audio_path = os.path.join(temp_dir, "filtered_audio.wav")
             
             try:
-                logger.debug(f"Step 1: Loading audio file from {input_path}")
-                # For voice filters, always treat input as audio file
-                # This eliminates video-related property access issues
-                audio = mp.AudioFileClip(input_path)
-                logger.debug(f"Step 2: Audio clip loaded successfully")
-                video = None  # No video handling for voice filters
+                logger.debug(f"Step 1: Loading file from {input_path} (video input: {is_video_input})")
+                
+                # Load the input file
+                if is_video_input:
+                    # Load as video to preserve video track
+                    video = mp.VideoFileClip(input_path)
+                    audio = video.audio
+                else:
+                    # Load as audio only
+                    audio = mp.AudioFileClip(input_path)
+                    video = None
+                
+                logger.debug(f"Step 2: File loaded successfully")
                 
                 if audio is None:
                     raise ValueError("Input file has no audio track")
@@ -167,16 +180,34 @@ class AudioService:
                 # Create output audio with filtered audio
                 filtered_audio_clip = mp.AudioFileClip(filtered_audio_path)
                 
-                logger.debug(f"Step 10: Writing final output to {output_path}")
-                # Since voice filters are for audio only, always output audio
-                filtered_audio_clip.write_audiofile(output_path, logger=None, verbose=False)
+                logger.debug(f"Step 10: Writing final output to {output_path} (video output: {is_video_output})")
+                
+                # Handle output format - preserve video if input was video and output should be video
+                if is_video_input and is_video_output and video is not None:
+                    # Create video with filtered audio
+                    final_video = video.set_audio(filtered_audio_clip)
+                    final_video.write_videofile(
+                        output_path,
+                        codec='libx264',
+                        audio_codec='aac',
+                        audio_bitrate='320k',
+                        verbose=False,
+                        logger=None
+                    )
+                    final_video.close()
+                    logger.info(f"Voice filter applied to video successfully: {output_path}")
+                else:
+                    # Output audio only
+                    filtered_audio_clip.write_audiofile(output_path, logger=None, verbose=False)
+                    logger.info(f"Voice filter applied to audio successfully: {output_path}")
                 
                 logger.debug(f"Step 11: Cleaning up clips")
                 # Clean up clips
                 audio.close()
                 filtered_audio_clip.close()
+                if video is not None:
+                    video.close()
                 
-                logger.info(f"Voice filter applied successfully: {output_path}")
                 return output_path
                 
             except Exception as e:
