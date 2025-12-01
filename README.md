@@ -551,7 +551,6 @@ done
 
 - 🐛 **Issues**: [GitHub Issues](https://github.com/jdportugal/VideoEditorAPI/issues)
 - 💬 **Discussions**: [GitHub Discussions](https://github.com/jdportugal/VideoEditorAPI/discussions)
-- 📧 **Email**: Create an issue for support
 
 ## 📄 License
 
