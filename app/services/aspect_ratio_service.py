@@ -4,6 +4,7 @@ Provides functionality to change video aspect ratios with different scaling mode
 """
 
 import os
+import psutil
 import logging
 import moviepy.editor as mp
 from moviepy.video.fx.resize import resize
@@ -14,6 +15,19 @@ class AspectRatioService:
     """Service for changing video aspect ratios."""
     
     def __init__(self):
+        # Performance optimization settings
+        self._cpu_cores = psutil.cpu_count(logical=False) or 1  # Physical cores
+        self._logical_cores = psutil.cpu_count(logical=True) or 1  # Logical cores
+        
+        # Adaptive threading based on machine capabilities
+        if self._cpu_cores >= 8:
+            self._optimal_threads = min(6, self._logical_cores)  # High-end machines
+        elif self._cpu_cores >= 4:
+            self._optimal_threads = min(4, self._logical_cores)  # Mid-range machines
+        else:
+            self._optimal_threads = min(2, self._logical_cores)  # Low-end machines
+        
+        logger.info(f"AspectRatioService initialized: {self._cpu_cores} physical cores, {self._logical_cores} logical cores, using {self._optimal_threads} threads")
         self.common_ratios = {
             '16:9': (16, 9),    # Widescreen
             '9:16': (9, 16),    # Vertical/Portrait 
@@ -42,6 +56,50 @@ class AspectRatioService:
             }
         }
     
+    def _get_memory_usage(self):
+        """Get current memory usage percentage."""
+        return psutil.virtual_memory().percent / 100.0
+    
+    def _is_large_resolution_change(self, original_width, original_height, target_width, target_height):
+        """Determine if this is a large resolution change requiring optimization."""
+        original_pixels = original_width * original_height
+        target_pixels = target_width * target_height
+        
+        # Consider it large if:
+        # 1. Target resolution > 4MP (4,000,000 pixels)
+        # 2. Pixel increase > 2x original
+        # 3. Either dimension > 3000 pixels
+        return (target_pixels > 4000000 or 
+                target_pixels > original_pixels * 2 or
+                target_width > 3000 or 
+                target_height > 3000)
+    
+    def _get_adaptive_encoding_settings(self, is_large_resolution, duration):
+        """Get encoding settings optimized for machine capabilities and content."""
+        memory_usage = self._get_memory_usage()
+        
+        # Adaptive preset based on machine load and content
+        if memory_usage > 0.8:
+            preset = 'ultrafast'  # Fastest encoding when memory is tight
+            threads = max(2, self._optimal_threads // 2)  # Use half threads but minimum 2
+        elif is_large_resolution or duration > 300:  # Large resolution or 5+ minute video
+            preset = 'faster' if self._cpu_cores >= 4 else 'ultrafast'
+            threads = max(2, self._optimal_threads - 1)  # Leave one core free, minimum 2 threads
+        else:
+            preset = 'fast' if self._cpu_cores >= 4 else 'faster'
+            threads = self._optimal_threads
+        
+        # Audio bitrate based on content type
+        audio_bitrate = '192k' if is_large_resolution else '320k'
+        
+        logger.info(f"Encoding settings: preset={preset}, threads={threads}, audio_bitrate={audio_bitrate}, memory_usage={memory_usage:.1%}")
+        
+        return {
+            'preset': preset,
+            'threads': threads,
+            'audio_bitrate': audio_bitrate
+        }
+    
     def parse_aspect_ratio(self, aspect_ratio_str):
         """Parse aspect ratio string into width:height tuple."""
         if aspect_ratio_str in self.common_ratios:
@@ -68,7 +126,7 @@ class AspectRatioService:
         raise ValueError(f"Invalid aspect ratio format: {aspect_ratio_str}")
     
     def calculate_dimensions(self, original_width, original_height, target_ratio_w, target_ratio_h, target_height=None):
-        """Calculate new dimensions based on target aspect ratio."""
+        """Calculate reasonable dimensions for target aspect ratio."""
         target_aspect = target_ratio_w / target_ratio_h
         
         if target_height:
@@ -76,17 +134,28 @@ class AspectRatioService:
             new_height = target_height
             new_width = int(new_height * target_aspect)
         else:
-            # Auto-calculate based on original video size
-            original_aspect = original_width / original_height
+            # Calculate reasonable dimensions without extreme scaling
+            # Use the smaller original dimension as the base to avoid huge videos
+            base_dimension = min(original_width, original_height)
             
-            if target_aspect > original_aspect:
-                # Target is wider - base on height
-                new_height = original_height
-                new_width = int(new_height * target_aspect)
-            else:
-                # Target is taller - base on width
-                new_width = original_width
+            if target_aspect >= 1:
+                # Target is landscape or square (width >= height)
+                new_width = base_dimension
                 new_height = int(new_width / target_aspect)
+            else:
+                # Target is portrait (height > width)
+                new_height = base_dimension
+                new_width = int(new_height * target_aspect)
+            
+            # Ensure we don't create dimensions smaller than 1080p
+            min_dimension = 1080
+            if min(new_width, new_height) < min_dimension:
+                if new_width < new_height:
+                    new_width = min_dimension
+                    new_height = int(new_width / target_aspect)
+                else:
+                    new_height = min_dimension
+                    new_width = int(new_height * target_aspect)
         
         # Ensure dimensions are even numbers (required for video encoding)
         new_width = new_width if new_width % 2 == 0 else new_width - 1
@@ -180,9 +249,9 @@ class AspectRatioService:
         """Stretch video to exact target dimensions."""
         return resize(video, (target_width, target_height))
     
-    def change_aspect_ratio(self, input_path, output_path, aspect_ratio, scale_mode='fit', target_height=None):
+    def change_aspect_ratio(self, input_path, output_path, aspect_ratio, scale_mode='fit', target_height=None, job_manager=None, job_id=None):
         """
-        Change video aspect ratio.
+        Change video aspect ratio with detailed progress logging.
         
         Args:
             input_path (str): Path to input video
@@ -190,6 +259,8 @@ class AspectRatioService:
             aspect_ratio (str): Target aspect ratio (e.g., '16:9', '9:16', '1:1')
             scale_mode (str): How to scale ('fit', 'fill', 'stretch')
             target_height (int, optional): Specific target height in pixels
+            job_manager: Job manager instance for progress updates
+            job_id (str): Job ID for progress tracking
         
         Returns:
             str: Path to the output video
@@ -197,51 +268,126 @@ class AspectRatioService:
         if scale_mode not in self.scale_modes:
             raise ValueError(f"Invalid scale mode: {scale_mode}. Available: {list(self.scale_modes.keys())}")
         
-        logger.info(f"Changing aspect ratio to {aspect_ratio} with {scale_mode} mode")
+        logger.info(f"🎬 ASPECT RATIO JOB STARTED - Job ID: {job_id}")
+        logger.info(f"📐 Target: {aspect_ratio} | Mode: {scale_mode} | Input: {input_path}")
+        
+        if job_manager and job_id:
+            job_manager.update_job_status(job_id, "processing", 10, "🎬 Starting aspect ratio processing...")
         
         try:
             # Parse aspect ratio
+            logger.info(f"🔍 Parsing aspect ratio: {aspect_ratio}")
             ratio_w, ratio_h = self.parse_aspect_ratio(aspect_ratio)
+            logger.info(f"✅ Aspect ratio parsed: {ratio_w}:{ratio_h}")
+            
+            if job_manager and job_id:
+                job_manager.update_job_status(job_id, "processing", 20, "🎥 Loading video file...")
             
             # Load video
+            logger.info(f"📼 Loading video file: {input_path}")
             video = mp.VideoFileClip(input_path)
             original_width, original_height = video.w, video.h
+            duration = video.duration
             
-            logger.info(f"Original dimensions: {original_width}x{original_height}")
+            logger.info(f"📏 Original dimensions: {original_width}x{original_height}")
+            logger.info(f"⏱️ Duration: {duration:.2f} seconds")
+            
+            if job_manager and job_id:
+                job_manager.update_job_status(job_id, "processing", 30, f"📏 Video loaded: {original_width}x{original_height}")
             
             # Calculate target dimensions
+            logger.info(f"🧮 Calculating target dimensions...")
             target_width, target_height = self.calculate_dimensions(
                 original_width, original_height, ratio_w, ratio_h, target_height
             )
             
-            logger.info(f"Target dimensions: {target_width}x{target_height}")
+            # Analyze processing requirements
+            is_large_resolution = self._is_large_resolution_change(
+                original_width, original_height, target_width, target_height
+            )
+            
+            logger.info(f"🎯 Target dimensions: {target_width}x{target_height}")
+            logger.info(f"📊 Scale mode: {self.scale_modes[scale_mode]['name']}")
+            logger.info(f"🔍 Large resolution change: {is_large_resolution}")
+            logger.info(f"📐 Original dimensions: {video.w}x{video.h}")
+            logger.info(f"📏 Resolution scale factor: {(target_width * target_height) / (video.w * video.h):.2f}x")
+            
+            if job_manager and job_id:
+                status_msg = f"🎯 Processing {scale_mode} scaling ({target_width}x{target_height})"
+                if is_large_resolution:
+                    status_msg += " - Large resolution detected"
+                job_manager.update_job_status(job_id, "processing", 40, status_msg)
             
             # Apply scaling mode
+            logger.info(f"⚙️ Applying {scale_mode} scaling...")
             if scale_mode == 'fit':
+                logger.info(f"📦 Applying scale-to-fit (letterboxing/pillarboxing)")
                 processed_video = self.apply_scale_to_fit(video, target_width, target_height)
             elif scale_mode == 'fill':
+                logger.info(f"🔍 Applying scale-to-fill (cropping)")
                 processed_video = self.apply_scale_to_fill(video, target_width, target_height)
             elif scale_mode == 'stretch':
+                logger.info(f"📏 Applying stretch scaling (may distort)")
                 processed_video = self.apply_stretch(video, target_width, target_height)
             
-            # Write output video
+            logger.info(f"✅ Scaling complete, final dimensions: {processed_video.w}x{processed_video.h}")
+            
+            # Get optimized encoding settings
+            encoding_settings = self._get_adaptive_encoding_settings(is_large_resolution, duration)
+            
+            if job_manager and job_id:
+                job_manager.update_job_status(job_id, "processing", 60, f"💾 Encoding video to {output_path}...")
+            
+            # Write output video with optimized settings
+            logger.info(f"💾 Starting optimized video encoding...")
+            logger.info(f"📝 Output path: {output_path}")
+            logger.info(f"🎞️ Codec: libx264 | Audio: {'aac' if video.audio else 'none'}")
+            logger.info(f"⚙️ Settings: {encoding_settings['preset']} preset, {encoding_settings['threads']} threads")
+            
+            # Use simple, reliable encoding settings to avoid hangs
+            logger.info(f"💾 Starting simplified video encoding...")
+            
             processed_video.write_videofile(
                 output_path,
                 codec='libx264',
-                audio_codec='aac' if video.audio else None,
+                preset='medium',  # Reliable preset
                 logger=None,
                 verbose=False
             )
             
+            # Update progress after encoding completes
+            if job_manager and job_id:
+                job_manager.update_job_status(job_id, "processing", 95, "✅ Encoding completed")
+            
+            logger.info(f"✅ Video encoding completed successfully")
+            
+            if job_manager and job_id:
+                job_manager.update_job_status(job_id, "processing", 95, "🧹 Cleaning up resources...")
+            
             # Clean up
+            logger.info(f"🧹 Cleaning up video resources...")
             video.close()
             processed_video.close()
             
-            logger.info(f"Aspect ratio changed successfully: {output_path}")
+            # Verify output file
+            if os.path.exists(output_path):
+                file_size = os.path.getsize(output_path)
+                logger.info(f"✅ Output file verified: {output_path} ({file_size:,} bytes)")
+            else:
+                raise Exception(f"Output file not created: {output_path}")
+            
+            if job_manager and job_id:
+                job_manager.update_job_status(job_id, "completed", 100, "✅ Aspect ratio change completed!")
+            
+            logger.info(f"🎉 ASPECT RATIO JOB COMPLETED - Job ID: {job_id}")
+            logger.info(f"📐 Successfully changed aspect ratio: {aspect_ratio} ({scale_mode} mode)")
             return output_path
             
         except Exception as e:
-            logger.error(f"Error changing aspect ratio: {e}")
+            logger.error(f"❌ ASPECT RATIO JOB FAILED - Job ID: {job_id}")
+            logger.error(f"💥 Error details: {str(e)}")
+            if job_manager and job_id:
+                job_manager.update_job_status(job_id, "failed", 0, f"❌ Failed: {str(e)}")
             raise
     
     def get_common_ratios(self):

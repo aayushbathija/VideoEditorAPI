@@ -1217,23 +1217,28 @@ def process_aspect_ratio_job(job_id, data):
         
         job_manager.update_job_status(job_id, "processing", 35, f"📐 Changing aspect ratio to {data['aspect_ratio']}...")
         
-        # Apply aspect ratio change
+        # Apply aspect ratio change (this will set job status to completed)
         aspect_ratio_service.change_aspect_ratio(
             input_path,
             output_path,
             data['aspect_ratio'],
             data['scale_mode'],
-            data.get('target_height')
+            data.get('target_height'),
+            job_manager=job_manager,
+            job_id=job_id
         )
         
         # Verify output
         if not os.path.exists(output_path):
             raise Exception("Aspect ratio change failed - output file not created")
         
+        # Complete the job with final details (status already set by service)
         processing_time = time.time() - start_time
-        job_manager.update_job_status(job_id, "completed", 100, f"✅ Aspect ratio changed in {processing_time:.1f}s")
-        
-        job_manager.complete_job(job_id, {"output_path": output_path})
+        job_manager.complete_job(job_id, {
+            "output_path": output_path, 
+            "processing_time": f"{processing_time:.1f}s",
+            "final_status": "✅ Aspect ratio change completed successfully"
+        })
         
     except Exception as e:
         processing_time = time.time() - start_time

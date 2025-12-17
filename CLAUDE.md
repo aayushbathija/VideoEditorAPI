@@ -137,18 +137,232 @@ static/                # Static output files
 
 ## API Endpoints
 
-### Core Operations
-- `POST /add-subtitles` - Whisper AI subtitle generation with karaoke effects
-- `POST /split-video` - Split video by time (supports job chaining)
-- `POST /join-videos` - Concatenate multiple videos
-- `POST /add-music` - Add background music with fade effects
-- `GET /job-status/{job_id}` - Poll job progress
-- `GET /download/{job_id}` - Download processed video
-- `GET /download-subtitles/{job_id}` - Download SRT file
+### Subtitle Operations
 
-### Admin Operations  
-- `POST /admin/cleanup` - Comprehensive cleanup of all files and jobs
-- `GET /health` - Service health check
+#### Generate Subtitles Only
+```http
+POST /generate-subtitles
+Content-Type: application/json
+
+{
+  "url": "https://drive.google.com/uc?id=YOUR_FILE_ID&export=download",
+  "model": "base"  // Optional: tiny, base, small, medium, large
+}
+```
+
+#### Add Subtitles to Video
+```http
+POST /add-subtitles  
+Content-Type: application/json
+
+{
+  "url": "https://drive.google.com/uc?id=YOUR_FILE_ID&export=download",
+  "subtitle_mode": "karaoke",  // off, karaoke, popup, typewriter
+  "model": "base",             // Optional: tiny, base, small, medium, large
+  "font_size": 60,             // Optional: default 60
+  "font_color": "#FFFF00",     // Optional: yellow default
+  "normal_color": "#FFFFFF",   // Optional: white default for non-active words
+  "position": "bottom"         // Optional: bottom, top, center
+}
+```
+
+### Video Editing Operations
+
+#### Split Video by Time
+```http
+POST /split-video
+Content-Type: application/json
+
+{
+  "url": "https://drive.google.com/uc?id=YOUR_FILE_ID&export=download",
+  "start_time": "00:01:30",    // Format: HH:MM:SS or SS.SS
+  "end_time": "00:03:45"       // Format: HH:MM:SS or SS.SS
+}
+```
+
+#### Join Multiple Videos
+```http
+POST /join-videos
+Content-Type: application/json
+
+{
+  "video_urls": [
+    "https://drive.google.com/uc?id=FILE1_ID&export=download",
+    "https://drive.google.com/uc?id=FILE2_ID&export=download"
+  ]
+}
+```
+
+### Audio Operations
+
+#### Add Background Music
+```http
+POST /add-music
+Content-Type: application/json
+
+{
+  "video_url": "https://drive.google.com/uc?id=YOUR_VIDEO_ID&export=download",
+  "music_url": "https://drive.google.com/uc?id=YOUR_MUSIC_ID&export=download",
+  "volume": "0.3",         // Music volume (0.0-1.0)
+  "fade_in": "2.0",        // Optional: fade in duration in seconds
+  "fade_out": "3.0",       // Optional: fade out duration in seconds
+  "loop_music": "true"     // Optional: loop music to match video length
+}
+```
+
+#### Apply Voice Filters
+```http
+POST /voice-filters
+Content-Type: application/json
+
+{
+  "url": "https://drive.google.com/uc?id=YOUR_FILE_ID&export=download",
+  "filter_type": "telephone"  // telephone, radio, walkie_talkie
+}
+```
+
+#### List Available Voice Filters
+```http
+GET /voice-filters/list
+```
+
+### Video Effects
+
+#### Apply Video Filters
+```http
+POST /video-filters
+Content-Type: application/json
+
+{
+  "url": "https://drive.google.com/uc?id=YOUR_FILE_ID&export=download",
+  "filter_type": "crt",
+  "custom_parameters": {      // Optional: override default parameters
+    "scanline_intensity": 0.3,
+    "curvature": 0.02
+  }
+}
+```
+
+#### List Available Video Filters
+```http
+GET /video-filters/list
+```
+
+#### Get Filter Parameters
+```http
+GET /video-filters/parameters/{filter_type}
+```
+
+#### Change Aspect Ratio
+```http
+POST /video-aspect-ratio
+Content-Type: application/json
+
+{
+  "url": "https://drive.google.com/uc?id=YOUR_FILE_ID&export=download",
+  "target_ratio": "9:16",     // 16:9, 9:16, 4:3, 3:4, 1:1
+  "scale_mode": "fill",       // fit, fill, stretch
+  "background_color": "#000000"  // Optional: for fit mode
+}
+```
+
+#### List Aspect Ratios
+```http
+GET /video-aspect-ratio/ratios
+```
+
+#### List Scale Modes
+```http
+GET /video-aspect-ratio/modes
+```
+
+### Voiceover Operations
+
+#### Add Voiceover to Video
+```http
+POST /add-voiceover
+Content-Type: application/json
+
+{
+  "video_url": "https://drive.google.com/uc?id=YOUR_VIDEO_ID&export=download",
+  "voiceover_url": "https://drive.google.com/uc?id=YOUR_AUDIO_ID&export=download",
+  "mode": "overlay",          // overlay, replace
+  "voiceover_volume": "0.8",  // Optional: 0.0-1.0, default 0.8
+  "original_volume": "0.3"    // Optional: 0.0-1.0, default 0.3 (for overlay mode)
+}
+```
+
+### Job Management
+
+#### Check Job Status
+```http
+GET /job-status/{job_id}
+```
+
+**Response:**
+```json
+{
+  "job_id": "uuid-here",
+  "status": "completed",      // pending, processing, completed, failed
+  "progress": 100,            // 0-100
+  "status_message": "✅ Processing complete",
+  "created_at": "2025-11-28T10:00:00",
+  "updated_at": "2025-11-28T10:02:30",
+  "output_path": "temp/uuid_output.mp4",
+  "error": null
+}
+```
+
+#### Download Result
+```http
+GET /download/{job_id}
+```
+
+#### Download Subtitles
+```http
+GET /download-subtitles/{job_id}
+```
+
+### System Operations
+
+#### Health Check
+```http
+GET /health
+```
+
+#### Admin Cleanup
+```http
+POST /admin/cleanup
+```
+
+**Response:**
+```json
+{
+  "message": "Cleanup completed",
+  "deleted_jobs": 45,
+  "deleted_temp_files": 23,
+  "deleted_uploads": 12,
+  "freed_space_mb": 1024.5
+}
+```
+
+## Common Response Formats
+
+### Job Creation Response
+```json
+{
+  "job_id": "uuid-here",
+  "status": "pending",
+  "message": "Job started successfully"
+}
+```
+
+### Error Response
+```json
+{
+  "error": "Description of the error"
+}
+```
 
 ## Development Notes
 
@@ -252,3 +466,161 @@ curl http://localhost:8080/system-status
 - `GET /system-status` - Detailed memory/CPU metrics and worker status
 - `GET /health` - Enhanced health check with resource warnings
 - Enhanced job status includes memory usage during processing
+
+## Troubleshooting Guide
+
+### Common Issues and Solutions
+
+#### 1. Music Adding Failed: Invalid URL
+**Error:** `"Failed to download 1: Invalid URL '1': No scheme supplied"`
+
+**Problem:** Using invalid URL for `music_url` parameter (e.g., `"1"` instead of actual URL)
+
+**Solution:** Provide a valid URL to a music file:
+```json
+{
+  "video_url": "https://drive.google.com/uc?id=YOUR_VIDEO_ID&export=download",
+  "music_url": "https://drive.google.com/uc?id=YOUR_MUSIC_FILE_ID&export=download"
+}
+```
+
+#### 2. Subtitle Endpoint 404 Error
+**Error:** `404 Not Found` when calling `/add_subtitles`
+
+**Problem:** Wrong endpoint URL (underscore vs hyphen)
+
+**Solution:** Use correct endpoint with hyphen:
+```bash
+# Wrong
+POST /add_subtitles
+
+# Correct  
+POST /add-subtitles
+```
+
+#### 3. Bad Request for Color Parameters
+**Error:** `400 Bad Request` with color parameter errors
+
+**Problem:** Invalid color format or parameter names
+
+**Solution:** Use correct format and parameter names:
+```json
+{
+  "font_color": "#FFFF00",    // Correct: 6-digit hex with #
+  "normal_color": "#FFFFFF"   // Correct: normal-color, not normal_color
+}
+```
+
+#### 4. Video Filter Returns Audio Instead of Video  
+**Error:** Google Drive URLs return WAV files instead of video with filtered audio
+
+**Problem:** File type detection failing for Google Drive URLs
+
+**Solution:** This is now fixed in the current version. The system downloads the file first to detect the actual content type.
+
+#### 5. Invalid Scale Mode for Aspect Ratio
+**Error:** `400 Bad Request` when using unsupported scale mode
+
+**Problem:** Using non-existent scale mode like `"crop"`
+
+**Solution:** Use valid scale modes:
+- `"fit"` - Fit within target ratio with letterboxing
+- `"fill"` - Fill target ratio (may crop content)
+- `"stretch"` - Stretch to exact ratio
+
+#### 6. Google Drive Access Issues
+**Error:** `Failed to download` or HTML content instead of file
+
+**Solutions:**
+1. **Make file publicly accessible:** Share → Anyone with link can view
+2. **Use correct download URL format:**
+   ```
+   https://drive.google.com/uc?id=FILE_ID&export=download
+   ```
+3. **Check file size:** Files >25MB may require additional confirmation
+4. **Verify file type:** Ensure file is actually video/audio format
+
+#### 7. Job Processing Stuck
+**Error:** Job remains in "processing" state indefinitely
+
+**Solutions:**
+1. **Check job status with details:**
+   ```bash
+   curl http://localhost:8080/job-status/YOUR_JOB_ID
+   ```
+2. **Check system resources:**
+   ```bash
+   curl http://localhost:8080/health
+   ```
+3. **Clean up if needed:**
+   ```bash
+   curl -X POST http://localhost:8080/admin/cleanup
+   ```
+
+#### 8. Out of Memory Errors
+**Error:** Jobs failing with memory-related errors
+
+**Solutions:**
+1. **Use optimized version:**
+   ```bash
+   python app_optimized.py
+   ```
+2. **Process shorter video segments**
+3. **Use smaller Whisper model:** `"tiny"` instead of `"base"`
+4. **Clean up temp files:** Use `/admin/cleanup` endpoint
+
+#### 9. Font Not Found Errors
+**Error:** Subtitle rendering fails with font errors
+
+**Solution:** Ensure fonts are available in deployment environment:
+```bash
+# Install required fonts (Ubuntu/Debian)
+sudo apt-get install fonts-dejavu-core
+
+# Or copy custom fonts to system directory
+sudo cp fonts/LuckiestGuy-Regular.ttf /usr/share/fonts/truetype/
+sudo fc-cache -f
+```
+
+#### 10. Container Port Issues
+**Error:** Cannot connect to API on port 8080
+
+**Solutions:**
+1. **Check container status:**
+   ```bash
+   docker ps
+   ```
+2. **Check port mapping:**
+   ```bash
+   docker-compose logs
+   ```
+3. **Rebuild if needed:**
+   ```bash
+   docker-compose down
+   docker-compose up -d --build
+   ```
+
+### Best Practices
+
+#### 1. File URL Guidelines
+- **Google Drive:** Use `uc?id=FILE_ID&export=download` format
+- **Direct URLs:** Ensure files are publicly accessible
+- **File Size:** Keep files under reasonable limits for processing time
+- **Format Support:** MP4 for video, MP3/WAV for audio
+
+#### 2. Parameter Validation
+- **Colors:** Use 6-digit hex format with # prefix
+- **Times:** Use HH:MM:SS or decimal seconds format
+- **Volumes:** Use decimal values between 0.0 and 1.0
+- **Required Fields:** Always include all required parameters
+
+#### 3. Error Monitoring
+- **Job Status:** Regularly check job progress via `/job-status/{job_id}`
+- **System Health:** Monitor `/health` endpoint for resource issues
+- **Logs:** Check Docker logs for detailed error messages
+
+#### 4. Performance Optimization
+- **Video Length:** Process longer videos in segments when possible
+- **Model Selection:** Use appropriate Whisper model for your accuracy needs
+- **Concurrent Jobs:** Limit concurrent processing on constrained systems
+- **Cleanup:** Regularly clean up temp files and completed jobs
