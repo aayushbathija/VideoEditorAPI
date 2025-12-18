@@ -198,49 +198,30 @@ class VoiceoverService:
             
             # Apply zoom effect only if zoom_factor > 1.0
             if zoom_factor > 1.0:
-                # Create a proper centered zoom effect
-                def make_frame_zoom(get_frame, t):
-                    """Apply zoom with proper centering."""
-                    # Get the original frame
-                    frame = get_frame(t)
-                    
-                    # Calculate current zoom level (linear from 1.0 to zoom_factor)
-                    progress = t / duration
-                    current_zoom = 1.0 + (zoom_factor - 1.0) * progress
-                    
-                    # Calculate the size we need before cropping
-                    zoomed_width = int(target_width * current_zoom)
-                    zoomed_height = int(target_height * current_zoom)
-                    
-                    # Resize frame to zoomed dimensions
-                    from PIL import Image as PILImage
-                    frame_image = PILImage.fromarray(frame)
-                    zoomed_frame = frame_image.resize((zoomed_width, zoomed_height), PILImage.LANCZOS)
-                    zoomed_array = np.array(zoomed_frame)
-                    
-                    # Calculate center crop coordinates
-                    center_x = zoomed_width // 2
-                    center_y = zoomed_height // 2
-                    
-                    # Calculate crop boundaries
-                    left = center_x - target_width // 2
-                    right = left + target_width
-                    top = center_y - target_height // 2
-                    bottom = top + target_height
-                    
-                    # Ensure boundaries are within the zoomed frame
-                    left = max(0, min(left, zoomed_width - target_width))
-                    top = max(0, min(top, zoomed_height - target_height))
-                    right = left + target_width
-                    bottom = top + target_height
-                    
-                    # Crop to final size
-                    cropped_frame = zoomed_array[top:bottom, left:right]
-                    
-                    return cropped_frame
+                # Use MoviePy's smooth scaling approach for jitter-free zoom
+                logger.info(f"Applying smooth zoom effect from 1.0 to {zoom_factor}")
                 
-                # Apply the zoom transformation
-                clip = clip.fl(make_frame_zoom, apply_to=['mask'])
+                # Start with oversized clip for smooth zoom
+                initial_scale = zoom_factor
+                initial_width = int(target_width * initial_scale)
+                initial_height = int(target_height * initial_scale)
+                
+                # Resize the clip to the maximum zoom size
+                clip = clip.resize((initial_width, initial_height))
+                
+                # Create smooth zoom animation using MoviePy's resize effect over time
+                def smooth_resize(t):
+                    """Calculate smooth resize factor over time."""
+                    progress = t / duration
+                    # Zoom from initial_scale down to 1.0 (reverse zoom for smooth effect)
+                    current_scale = initial_scale - (initial_scale - 1.0) * progress
+                    return current_scale
+                
+                # Apply time-varying resize for smooth zoom animation
+                clip = clip.resize(lambda t: smooth_resize(t)).set_position('center')
+                
+                # Crop to final target size to remove any overscan
+                clip = clip.crop(width=target_width, height=target_height, x_center=initial_width//2, y_center=initial_height//2)
             else:
                 # No zoom - just resize to target dimensions
                 clip = clip.resize((target_width, target_height))
