@@ -16,6 +16,8 @@ import json
 from datetime import datetime
 import re
 import logging
+import mimetypes
+import shutil
 
 # Import services
 from app.services.video_service import VideoService
@@ -86,6 +88,88 @@ def parse_time_to_seconds(time_input):
         raise ValueError(f"Invalid time format: {time_input}")
     
     raise ValueError(f"Unsupported time type: {type(time_input)}")
+
+def detect_and_rename_media_file(temp_path, job_id):
+    """
+    Detect the actual file type of downloaded media and rename with correct extension.
+    
+    Args:
+        temp_path: Path to the temporary downloaded file
+        job_id: Job ID for generating the new filename
+    
+    Returns:
+        str: Path to the renamed file with correct extension
+    """
+    try:
+        # Try to detect file type using multiple methods
+        detected_ext = None
+        
+        # Method 1: Use mimetypes to guess from file content
+        mime_type, _ = mimetypes.guess_type(temp_path)
+        
+        if not mime_type:
+            # Method 2: Try to read file signature/magic bytes
+            with open(temp_path, 'rb') as f:
+                header = f.read(16)
+                
+                # Check common image signatures
+                if header.startswith(b'\x89PNG\r\n\x1a\n'):
+                    mime_type = 'image/png'
+                elif header.startswith(b'\xff\xd8\xff'):
+                    mime_type = 'image/jpeg'
+                elif header.startswith(b'GIF87a') or header.startswith(b'GIF89a'):
+                    mime_type = 'image/gif'
+                elif header.startswith(b'BM'):
+                    mime_type = 'image/bmp'
+                # Check video signatures
+                elif b'ftypmp4' in header or b'ftypisom' in header:
+                    mime_type = 'video/mp4'
+                elif header.startswith(b'\x1aE\xdf\xa3'):
+                    mime_type = 'video/webm'
+                elif header.startswith(b'RIFF') and b'AVI ' in header:
+                    mime_type = 'video/avi'
+        
+        # Map mime types to extensions
+        if mime_type:
+            if mime_type in ['image/png']:
+                detected_ext = '.png'
+            elif mime_type in ['image/jpeg']:
+                detected_ext = '.jpg'
+            elif mime_type in ['image/gif']:
+                detected_ext = '.gif'
+            elif mime_type in ['image/bmp']:
+                detected_ext = '.bmp'
+            elif mime_type in ['video/mp4']:
+                detected_ext = '.mp4'
+            elif mime_type in ['video/webm']:
+                detected_ext = '.webm'
+            elif mime_type in ['video/avi']:
+                detected_ext = '.avi'
+        
+        # Default to .mp4 if detection fails
+        if not detected_ext:
+            detected_ext = '.mp4'
+            logger.warning(f"Could not detect file type for {temp_path}, defaulting to .mp4")
+        
+        # Create new path with correct extension
+        new_path = f"temp/{job_id}_media{detected_ext}"
+        
+        # Rename the file
+        shutil.move(temp_path, new_path)
+        
+        logger.info(f"File type detected as {detected_ext}, renamed to {new_path}")
+        return new_path
+        
+    except Exception as e:
+        logger.error(f"Error detecting file type: {e}")
+        # Fallback: just rename to .mp4
+        fallback_path = f"temp/{job_id}_media.mp4"
+        try:
+            shutil.move(temp_path, fallback_path)
+            return fallback_path
+        except:
+            # If even rename fails, return original path
+            return temp_path
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -595,17 +679,21 @@ def add_voiceover():
     try:
         data = request.get_json()
         
-        # Validate required fields
-        if not data or 'video_url' not in data or 'audio_url' not in data:
-            return jsonify({"error": "Missing required fields: video_url and audio_url"}), 400
+        # Validate required fields - now support both video_url and image_url  
+        if not data or ('video_url' not in data and 'image_url' not in data) or 'audio_url' not in data:
+            return jsonify({"error": "Missing required fields: (video_url OR image_url) and audio_url"}), 400
+        
+        # Determine the media URL (prioritize video_url if both provided)
+        media_url = data.get('video_url') or data.get('image_url')
         
         # Create job
         job_id = str(uuid.uuid4())
         job_data = {
             "job_id": job_id,
             "operation": "add_voiceover",
-            "video_url": data["video_url"],
+            "media_url": media_url,
             "audio_url": data["audio_url"],
+            "zoom_factor": data.get("zoom_factor", 1.0),  # Default no zoom
             "created_at": datetime.now().isoformat()
         }
         
@@ -1275,10 +1363,17 @@ def process_voiceover_job(job_id, data):
     try:
         job_manager.update_job_status(job_id, "processing", 5, "🚀 Starting voiceover addition...")
         
-        # Download video file
-        job_manager.update_job_status(job_id, "processing", 15, "📥 Downloading video...")
-        video_path = download_file(data['video_url'], 'temp', f"{job_id}_video.mp4")
-        job_manager.update_job_status(job_id, "processing", 30, "✅ Video downloaded")
+        # Download media file (video or image)
+        job_manager.update_job_status(job_id, "processing", 15, "📥 Downloading media file...")
+        media_url = data['media_url']
+        
+        # Download with temporary name first, then detect actual format
+        temp_media_path = download_file(media_url, 'temp', f"{job_id}_media_temp")
+        job_manager.update_job_status(job_id, "processing", 25, "🔍 Detecting file format...")
+        
+        # Detect actual file type and rename appropriately
+        media_path = detect_and_rename_media_file(temp_media_path, job_id)
+        job_manager.update_job_status(job_id, "processing", 30, "✅ Media file downloaded and validated")
         
         # Download audio file
         job_manager.update_job_status(job_id, "processing", 35, "📥 Downloading audio...")
@@ -1287,25 +1382,30 @@ def process_voiceover_job(job_id, data):
         
         # Validate files
         job_manager.update_job_status(job_id, "processing", 55, "🔍 Validating media files...")
-        voiceover_service.validate_files(video_path, audio_path)
+        voiceover_service.validate_files(media_path, audio_path)
         
         # Get media info for duration analysis
-        video_info = voiceover_service.get_media_info(video_path)
-        audio_info = voiceover_service.get_media_info(audio_path)
-        
-        if video_info and audio_info:
-            duration_info = f"Video: {video_info['duration']:.1f}s, Audio: {audio_info['duration']:.1f}s"
-            job_manager.update_job_status(job_id, "processing", 60, f"📊 {duration_info}")
+        if voiceover_service.is_image_file(media_path):
+            job_manager.update_job_status(job_id, "processing", 60, "🖼️ Image detected - will create video with zoom")
+        else:
+            media_info = voiceover_service.get_media_info(media_path)
+            audio_info = voiceover_service.get_media_info(audio_path)
+            
+            if media_info and audio_info:
+                duration_info = f"Media: {media_info['duration']:.1f}s, Audio: {audio_info['duration']:.1f}s"
+                job_manager.update_job_status(job_id, "processing", 60, f"📊 {duration_info}")
         
         output_path = f"temp/{job_id}_with_voiceover.mp4"
         
         job_manager.update_job_status(job_id, "processing", 65, "🎤 Adding voiceover with duration matching...")
         
-        # Apply voiceover
+        # Apply voiceover with zoom factor
+        zoom_factor = data.get('zoom_factor', 1.0)
         voiceover_service.add_voiceover(
-            video_path,
+            media_path,
             audio_path,
-            output_path
+            output_path,
+            zoom_factor=zoom_factor
         )
         
         # Verify output
@@ -1338,7 +1438,7 @@ def process_voiceover_job(job_id, data):
     
     finally:
         # Clean up input files
-        for file_path in [video_path, audio_path]:
+        for file_path in [media_path, audio_path]:
             if file_path and os.path.exists(file_path):
                 try:
                     os.remove(file_path)

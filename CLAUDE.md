@@ -278,17 +278,23 @@ GET /video-aspect-ratio/modes
 
 ### Voiceover Operations
 
-#### Add Voiceover to Video
+#### Add Voiceover to Video or Create Video from Image
 ```http
 POST /add-voiceover
 Content-Type: application/json
 
+// For video input:
 {
   "video_url": "https://drive.google.com/uc?id=YOUR_VIDEO_ID&export=download",
-  "voiceover_url": "https://drive.google.com/uc?id=YOUR_AUDIO_ID&export=download",
-  "mode": "overlay",          // overlay, replace
-  "voiceover_volume": "0.8",  // Optional: 0.0-1.0, default 0.8
-  "original_volume": "0.3"    // Optional: 0.0-1.0, default 0.3 (for overlay mode)
+  "audio_url": "https://drive.google.com/uc?id=YOUR_AUDIO_ID&export=download",
+  "zoom_factor": 1.1          // Optional: zoom factor for animation (default 1.0 = no zoom)
+}
+
+// For image input (creates video with optional zoom effect):
+{
+  "image_url": "https://drive.google.com/uc?id=YOUR_IMAGE_ID&export=download",
+  "audio_url": "https://drive.google.com/uc?id=YOUR_AUDIO_ID&export=download",
+  "zoom_factor": 1.15         // Optional: zoom factor for animation (default 1.0 = no zoom)
 }
 ```
 
