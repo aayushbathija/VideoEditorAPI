@@ -39,7 +39,7 @@ COPY . .
 RUN mkdir -p temp uploads jobs static
 
 # Set environment variables
-ENV FLASK_APP=app.py
+ENV FLASK_APP=main.py
 ENV FLASK_ENV=production
 ENV PYTHONPATH=/app
 ENV PORT=8080
