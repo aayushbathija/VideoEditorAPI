@@ -30,6 +30,7 @@ COPY requirements.txt optimized_requirements.txt ./
 # Install Python dependencies (including optimization dependencies)
 RUN pip install --no-cache-dir "setuptools<81" wheel
 RUN pip install --no-cache-dir --no-build-isolation -r optimized_requirements.txt
+RUN pip install --no-cache-dir gunicorn
 
 # Copy application code
 COPY . .
@@ -51,4 +52,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
 # Run the unified application
-CMD ["python", "app.py"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "8", "--timeout", "300", "app:app"]
