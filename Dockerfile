@@ -28,7 +28,8 @@ WORKDIR /app
 COPY requirements.txt optimized_requirements.txt ./
 
 # Install Python dependencies (including optimization dependencies)
-RUN pip install --no-cache-dir -r optimized_requirements.txt
+RUN pip install --no-cache-dir "setuptools<81" wheel
+RUN pip install --no-cache-dir --no-build-isolation -r optimized_requirements.txt
 
 # Copy application code
 COPY . .
