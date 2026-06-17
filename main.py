@@ -3,7 +3,7 @@ Unified VideoEditor API Server
 Uses all available system resources with Whisper tiny model.
 """
 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response, stream_with_context
 from flask_cors import CORS
 import os
 import uuid
@@ -753,19 +753,37 @@ def get_job_status(job_id):
 
 @app.route('/download/<job_id>', methods=['GET'])
 def download_result(job_id):
-    """Download processed video file."""
+    """Download processed video file (streamed, chunked)."""
     try:
         job = job_manager.get_job(job_id)
         if not job:
             return jsonify({"error": "Job not found"}), 404
-        
         if job['status'] != 'completed':
             return jsonify({"error": "Job not completed yet"}), 400
-        
         if 'output_path' not in job:
             return jsonify({"error": "No output file available"}), 404
-        
-        return send_file(job['output_path'], as_attachment=True)
+
+        output_path = job['output_path']
+        if not os.path.exists(output_path):
+            return jsonify({"error": "Output file not found"}), 404
+
+        def generate():
+            with open(output_path, 'rb') as f:
+                while True:
+                    chunk = f.read(1024 * 1024)  # 1 MB
+                    if not chunk:
+                        break
+                    yield chunk
+
+        filename = os.path.basename(output_path)
+        return Response(
+            stream_with_context(generate()),
+            mimetype='video/mp4',
+            headers={'Content-Disposition': f'attachment; filename="{filename}"'},
+        )
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        return jsonify({"error": str(e)}), 500
         
     except Exception as e:
         logger.error(f"Download error: {e}")
